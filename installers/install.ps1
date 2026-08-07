@@ -5,7 +5,7 @@
 .DESCRIPTION
     One command, no parameters required:
 
-      irm https://raw.githubusercontent.com/Utkarsh-tiwari27/Vivaldi-Swift/main/installers/install.ps1 | iex
+      irm https://raw.githubusercontent.com/RaceConditionWinner/Vivaldi-Swift/main/installers/install.ps1 | iex
 
     Detects Vivaldi (per-user or per-machine), downloads vivaldi_swift.css
     and custom.js, patches window.html between marker comments, and
@@ -22,7 +22,7 @@ param()
 
 $ErrorActionPreference = "Stop"
 
-$Repo    = "Utkarsh-tiwari27/Vivaldi-Swift"
+$Repo    = "RaceConditionWinner/Vivaldi-Swift"
 $RawBase = "https://raw.githubusercontent.com/$Repo/main"
 $CssFile = "vivaldi_swift.css"
 $JsFile  = "custom.js"

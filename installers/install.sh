@@ -4,7 +4,7 @@
 # ----------------------------------------------------------------------------
 # One command, no flags required:
 #
-#   bash <(curl -fsSL https://raw.githubusercontent.com/Utkarsh-tiwari27/Vivaldi-Swift/main/installers/install.sh)
+#   bash <(curl -fsSL https://raw.githubusercontent.com/RaceConditionWinner/Vivaldi-Swift/main/installers/install.sh)
 #
 # What it does:
 #   detect OS -> find Vivaldi -> download vivaldi_swift.css + custom.js ->
@@ -19,7 +19,7 @@
 
 set -euo pipefail
 
-REPO="Utkarsh-tiwari27/Vivaldi-Swift"
+REPO="RaceConditionWinner/Vivaldi-Swift"
 RAW_BASE="https://raw.githubusercontent.com/$REPO/main"
 INSTALL_DIR="$HOME/.local/share/vivaldi-swift"   # holds our copy of css/js + one backup
 
