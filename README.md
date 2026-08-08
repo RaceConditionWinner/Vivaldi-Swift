@@ -68,11 +68,33 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Utkarsh-tiwari27/Vivaldi-Swi
 irm https://raw.githubusercontent.com/Utkarsh-tiwari27/Vivaldi-Swift/main/installers/install.ps1 | iex
 ```
 
-The installer detects your Vivaldi installation, downloads `vivaldi_swift.css` and `custom.js`,
-patches Vivaldi's UI to load them, verifies the result, and tells you when it's done. If it needs
-administrator/root privileges to write to your Vivaldi install, it will ask for them at that point.
+The installer detects your Vivaldi installation, downloads `vivaldi_swift.css` and `custom.js`
+into a canonical local folder, patches Vivaldi's UI to load them, verifies the result, and tells
+you when it's done. If it needs administrator/root privileges to write to your Vivaldi install, it
+will ask for them at that point — never for anything outside your Vivaldi installation.
 
 Restart Vivaldi afterwards to see the change.
+
+### Where files go
+
+The installer keeps one canonical local copy of Vivaldi Swift under your home directory, and
+deploys a copy of it into Vivaldi's own resource folder:
+
+```
+~/Vivaldi-Swift/              (%USERPROFILE%\Vivaldi-Swift on Windows)
+├── custom.js                 ← canonical copy
+├── vivaldi_swift.css         ← canonical copy
+└── backups/
+    └── window.html.orig      ← one backup of your original, untouched window.html
+
+<Vivaldi resources>/
+├── window.html                (patched)
+├── custom.js                  (deployed copy)
+└── vivaldi_swift.css          (deployed copy)
+```
+
+`~/Vivaldi-Swift` always belongs to your normal user account, even if the installer needed
+`sudo`/administrator rights to reach the Vivaldi folder itself.
 
 ## Supported installations
 
@@ -89,15 +111,22 @@ Snap and Flatpak builds sandbox Vivaldi's application files in a way that makes 
 these and want Vivaldi Swift, the most reliable path today is switching to the official `.deb`/`.rpm`
 or `.app` build.
 
+If more than one native Vivaldi installation is found (for example both a per-user and a
+per-machine install on Windows, or Stable alongside Snapshot on Linux), the installer won't guess
+— it lists what it found and asks you to remove or rename the one you don't use before rerunning.
+
 ## Updating
 
 **Vivaldi Swift itself:** rerun the same install command above. It always fetches the current
-`vivaldi_swift.css` and `custom.js` from this repository — there's no separate update command.
+`vivaldi_swift.css` and `custom.js` from this repository, updates the canonical copy under
+`~/Vivaldi-Swift`, and redeploys it. If nothing has actually changed, it says so and exits without
+touching anything.
 
 **After Vivaldi updates:** a Vivaldi update replaces `window.html`, which removes the patch (this
 is a Vivaldi limitation, not something Vivaldi Swift can prevent — see [FAQ](#faq)). Rerun the same
 install command to reapply it. There is intentionally no background service watching for this; see
-the FAQ for why.
+the FAQ for why. (A repair step that reuses the canonical `~/Vivaldi-Swift` copy automatically after
+an update is planned but not implemented yet — today, rerunning the command is the update path.)
 
 ## Uninstalling
 
@@ -105,9 +134,13 @@ Vivaldi Swift is two files plus a small marked block in one Vivaldi file — the
 script to keep in sync with the installer. To remove it:
 
 1. Open `window.html` in your Vivaldi resources folder (see paths below) and delete everything
-   between and including the `<!-- VIVALDI_SWIFT_START -->` and `<!-- VIVALDI_SWIFT_END -->` lines.
-2. Delete `vivaldi_swift.css` and `custom.js` from that same folder.
-3. Restart Vivaldi.
+   between and including the `<!-- VIVALDI_SWIFT_START -->` and `<!-- VIVALDI_SWIFT_END -->` lines
+   — or just restore it from the backup the installer made at
+   `~/Vivaldi-Swift/backups/window.html.orig` (`%USERPROFILE%\Vivaldi-Swift\backups\window.html.orig`
+   on Windows).
+2. Delete `vivaldi_swift.css` and `custom.js` from that same Vivaldi resources folder.
+3. Optionally delete the `~/Vivaldi-Swift` folder itself.
+4. Restart Vivaldi.
 
 Resource folder paths:
 - Linux: `<install>/resources/vivaldi/` (e.g. `/opt/vivaldi/resources/vivaldi/`)
@@ -140,8 +173,10 @@ Yes, as long as the Snapshot build is a native `.deb`/`.rpm`/`.app`/per-user or 
 install — detection isn't channel-specific, it just needs a `window.html` it can write to.
 
 **Is it safe to run the installer command multiple times?**
-Yes — it's idempotent. Re-running it with nothing changed does nothing; re-running it after a
-Vivaldi update or a Vivaldi Swift file update reapplies the patch cleanly.
+Yes — it's idempotent. Re-running it with nothing changed prints "Vivaldi Swift is already
+installed and up to date" and exits without touching anything; re-running it after a Vivaldi
+update or a Vivaldi Swift file update reapplies the patch cleanly, keeping exactly one marker
+block and one backup.
 
 ## License
 
