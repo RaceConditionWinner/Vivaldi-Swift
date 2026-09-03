@@ -15,21 +15,30 @@
    ===================
      .SpeedDial
        .thumbnail-favicon          ← Vivaldi's safe injection point
-         .custom-layout-wrapper    ← padding · scale  (CSS vars)
-           .custom-icon-wrapper    ← size · offset    (CSS vars)
-             <svg> or <img>
+         .custom-layout-wrapper    ← centering only, no card mutations
+           .custom-icon-wrapper    ← fixed size, flex child
+             <svg>
 
-   LAYOUT PROPERTIES (wrapper-scoped, no card mutations)
-   ======================================================
-     --custom-icon-size      icon diameter (px)
-     --custom-icon-offset-x  horizontal nudge  (px)
-     --custom-icon-offset-y  vertical nudge    (px)
-     --custom-padding        thumbnail inset   (px)
-     --custom-wrapper-scale  content scale     (unitless)
+   AUTOMATIC ICONS
+   ================
+   Speed Dial icons are resolved automatically from the tile's
+   target website — no manual upload, positioning, or scaling.
+   See the module map below. Vivaldi's native favicon is always
+   the fallback and is only ever hidden after a validated,
+   sanitized replacement SVG is ready to render.
 
-   Grouped by concern below: storage, icon sanitizing, asset
-   handling, rendering/injection, the editing overlay, the
-   context menu, the icon picker modal, and DOM observation.
+     SpeedDialUrlResolver  → recovers the tile's target URL
+     DomainNormalizer      → URL → apex domain
+     BrandResolver         → domain → theSVG slug candidate(s)
+     IconService           → cache (memory + chrome.storage.local),
+                              negative caching, in-flight dedup
+     TheSvgProvider        → fetches + validates SVGs from
+                              https://thesvg.org (jsDelivr mirror
+                              as a fallback host)
+     IconSanitizer         → same sanitizer the old manual-upload
+                              feature used; unchanged and reused
+     Renderer              → builds/injects the wrapper hierarchy
+
    No version numbers here — git history is the changelog.
    ============================================================ */
 
@@ -43,207 +52,24 @@ console.log("[Vivaldi Swift] loading…");
    ============================================================ */
 
 const OBSERVER_DEBOUNCE_MS = 100;
-const STORAGE_KEY = "vivaldi_swift";
+
+/** How long a resolved icon is trusted before we re-check it. */
+const POSITIVE_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+/** How long a confirmed "no icon for this domain" is trusted. */
+const NEGATIVE_CACHE_TTL_MS = 7  * 24 * 60 * 60 * 1000; // 7 days
+/** How long a network/CSP/timeout failure is trusted — short,
+ *  so a transient outage doesn't masquerade as "not found". */
+const ERROR_CACHE_TTL_MS    = 60 * 60 * 1000;            // 1 hour
 
 
 /* ============================================================
-   StorageManager
+   IconSanitizer
    ============================================================
-   {
-     tiles: {
-       [tileId]: {
-         icon?:   { type: "svg"|"png", data: string },
-         layout?: {
-           iconSize, iconOffsetX, iconOffsetY,
-           thumbnailPadding, wrapperScale
-         }
-       }
-     }
-   }
-
-   All layout properties are wrapper-scoped.
-   No card-level position or size fields.
-
-   This is the one storage schema Vivaldi Swift has ever needed
-   to support going forward. Earlier builds used a different
-   storage key and an older layout shape; that migration code
-   has been removed; upgrading from one of those very old builds
-   resets custom icons once, which is preferable to carrying
-   permanent migration code for a handful of legacy users.
-   ============================================================ */
-
-const StorageManager = (() => {
-
-    /** @type {{ tiles:Object.<string,object> }} */
-    let _store = { tiles: {} };
-
-    /** Frozen default layout — single allocation, never mutated. */
-    const _DEFAULT_LAYOUT = Object.freeze({
-        iconSize:         44,
-        iconOffsetX:      0,
-        iconOffsetY:      0,
-        thumbnailPadding: 0,
-        wrapperScale:     1.0,
-    });
-
-    /** Return a mutable copy of the default layout. */
-    function _defaultLayout() { return { ..._DEFAULT_LAYOUT }; }
-
-    /** True when layout differs from defaults (warrants keeping in storage). */
-    function _layoutIsCustom(layout) {
-        if (!layout) return false;
-        // Guard against NaN/non-finite values that could slip in from corrupted storage
-        const safe = (v, def) => Number.isFinite(v) ? v : def;
-        return (
-            safe(layout.iconSize,         44)  !== 44  ||
-            safe(layout.iconOffsetX,       0)  !== 0   ||
-            safe(layout.iconOffsetY,       0)  !== 0   ||
-            safe(layout.thumbnailPadding,  0)  !== 0   ||
-            safe(layout.wrapperScale,    1.0)  !== 1.0
-        );
-    }
-
-    /** Hydrate from chrome.storage.local. */
-    async function init() {
-        try {
-            const result = await chrome.storage.local.get(STORAGE_KEY);
-            const raw = result[STORAGE_KEY];
-
-            if (raw?.tiles && typeof raw.tiles === "object") {
-                _store = { tiles: {} };
-                for (const [id, rec] of Object.entries(raw.tiles)) {
-                    const valid = _validateRecord(rec);
-                    if (valid) _store.tiles[id] = valid;
-                }
-            } else {
-                _store = { tiles: {} };
-            }
-            const n = Object.keys(_store.tiles).length;
-            console.log(`[Vivaldi Swift] Hydrated — ${n} tile record(s).`);
-        } catch (e) {
-            console.error("[Vivaldi Swift] Storage init failed:", e);
-            _store = { tiles: {} };
-        }
-    }
-
-    /**
-     * Validate a single tile record from external storage.
-     * Returns a clean record or null if the record is unsalvageable.
-     */
-    function _validateRecord(rec) {
-        if (!rec || typeof rec !== "object") return null;
-        const out = {};
-
-        // Validate icon
-        if (rec.icon && typeof rec.icon === "object") {
-            const { type, data } = rec.icon;
-            if ((type === "svg" || type === "png") &&
-                typeof data === "string" &&
-                data.length > 0 &&
-                data.length < 5_000_000) {         // 5 MB hard cap
-                out.icon = { type, data };
-            }
-        }
-
-        // Validate layout (numeric fields only)
-        if (rec.layout && typeof rec.layout === "object") {
-            const l = rec.layout;
-            const num = (v, def) => Number.isFinite(Number(v)) ? Number(v) : def;
-            out.layout = {
-                iconSize:         num(l.iconSize,         44),
-                iconOffsetX:      num(l.iconOffsetX,       0),
-                iconOffsetY:      num(l.iconOffsetY,       0),
-                thumbnailPadding: num(l.thumbnailPadding,  0),
-                wrapperScale:     num(l.wrapperScale,    1.0),
-            };
-        }
-
-        return Object.keys(out).length ? out : null;
-    }
-
-    function _persist() {
-        chrome.storage.local
-            .set({ [STORAGE_KEY]: _store })
-            .catch(e => console.error("[Vivaldi Swift] Persist failed:", e));
-    }
-
-    /* ── Full-record accessors ─────────────────────────────── */
-
-    function get(id)    { return _store.tiles[id] || null; }
-    function has(id)    { return !!_store.tiles[id]; }
-    function remove(id) { if (id in _store.tiles) { delete _store.tiles[id]; _persist(); } }
-
-    async function clear() {
-        _store = { tiles: {} };
-        try   { await chrome.storage.local.remove(STORAGE_KEY); }
-        catch (e) { console.error("[Vivaldi Swift] Clear failed:", e); }
-    }
-
-    /* ── Icon accessors ────────────────────────────────────── */
-
-    function getIcon(id)    { return _store.tiles[id]?.icon || null; }
-    function hasIcon(id)    { return !!_store.tiles[id]?.icon; }
-
-    function setIcon(id, icon) {
-        if (!_store.tiles[id]) _store.tiles[id] = {};
-        _store.tiles[id].icon = icon;
-        _persist();
-    }
-
-    function removeIcon(id) {
-        if (!_store.tiles[id]) return;
-        delete _store.tiles[id].icon;
-        // Prune record if layout is also default/absent
-        if (!_layoutIsCustom(_store.tiles[id].layout)) {
-            delete _store.tiles[id];
-        }
-        _persist();
-    }
-
-    /* ── Layout accessors ──────────────────────────────────── */
-
-    function getLayout(id) {
-        return { ..._defaultLayout(), ...(_store.tiles[id]?.layout || {}) };
-    }
-
-    function hasCustomLayout(id) {
-        return _layoutIsCustom(_store.tiles[id]?.layout);
-    }
-
-    function setLayout(id, layout) {
-        if (!_store.tiles[id]) _store.tiles[id] = {};
-        _store.tiles[id].layout = { ..._defaultLayout(), ...layout };
-        _persist();
-    }
-
-    function resetLayout(id) {
-        if (!_store.tiles[id]) return;
-        delete _store.tiles[id].layout;
-        if (!_store.tiles[id].icon) delete _store.tiles[id];
-        _persist();
-    }
-
-    return {
-        init,
-        get, has, remove, clear,
-        getIcon, hasIcon, setIcon, removeIcon,
-        getLayout, hasCustomLayout, setLayout, resetLayout,
-        defaultLayout: _defaultLayout,
-    };
-
-})();
-
-
-/* ============================================================
-   PHASE 3 — IconSanitizer  (upgraded)
-   ============================================================
-   Security pass unchanged (allowlist, blocklist, attr scrub).
-   Enhancements:
-     • Removes width/height from SVG root (CSS controls sizing).
-     • Sets preserveAspectRatio="xMidYMid meet".
-     • Preserves viewBox; generates fallback from w/h before removal.
-     • sanitize(raw, idPrefix) namespaces IDs when prefix supplied;
-       called by Renderer at injection time.
+   Unchanged from the manual-upload era: allowlist/blocklist walk,
+   attribute scrub, ID namespacing. This is the same trust boundary
+   an automatically-fetched SVG has to cross — remote origin, so if
+   anything, it deserves more scrutiny than a user's own upload did,
+   not less.
    ============================================================ */
 
 const IconSanitizer = (() => {
@@ -322,7 +148,6 @@ const IconSanitizer = (() => {
     function _namespaceIds(svgEl, prefix) {
         const idMap = new Map();
 
-        // Pass 1 — collect and rename id attributes
         svgEl.querySelectorAll("[id]").forEach(el => {
             const old = el.getAttribute("id");
             const nw  = prefix + old;
@@ -337,9 +162,7 @@ const IconSanitizer = (() => {
             "marker-start","marker-mid","marker-end",
         ];
 
-        // Pass 2 — update cross-references
         svgEl.querySelectorAll("*").forEach(el => {
-            // url(#id) attribute references
             REF_ATTRS.forEach(attr => {
                 const v = el.getAttribute(attr);
                 if (v?.startsWith("url(#")) {
@@ -348,7 +171,6 @@ const IconSanitizer = (() => {
                 }
             });
 
-            // href / xlink:href fragment references
             ["href", "xlink:href"].forEach(attr => {
                 const v = el.getAttribute(attr);
                 if (v?.startsWith("#")) {
@@ -357,7 +179,6 @@ const IconSanitizer = (() => {
                 }
             });
 
-            // url() inside style attributes
             const style = el.getAttribute("style");
             if (style) {
                 let s = style;
@@ -393,14 +214,11 @@ const IconSanitizer = (() => {
             throw new Error("No SVG root element found");
         }
 
-        // Capture dimensions before removal (needed for fallback viewBox)
         const rawW = svgEl.getAttribute("width");
         const rawH = svgEl.getAttribute("height");
 
-        // Security pass
         _walk(svgEl);
 
-        // Preserve or generate viewBox
         let viewBox = svgEl.getAttribute("viewBox");
         if (!viewBox) {
             const w = parseFloat(rawW) || 512;
@@ -408,15 +226,12 @@ const IconSanitizer = (() => {
             viewBox = `0 0 ${w} ${h}`;
         }
 
-        // Remove dimensional attributes — CSS/renderer controls sizing
         svgEl.removeAttribute("width");
         svgEl.removeAttribute("height");
 
-        // Enforce aspect ratio and viewBox
         svgEl.setAttribute("viewBox", viewBox);
         svgEl.setAttribute("preserveAspectRatio", "xMidYMid meet");
 
-        // Namespace IDs if a prefix was supplied
         if (idPrefix) _namespaceIds(svgEl, idPrefix);
 
         return new XMLSerializer().serializeToString(svgEl);
@@ -428,141 +243,15 @@ const IconSanitizer = (() => {
 
 
 /* ============================================================
-   PHASE 2 — AssetManager
+   DOM HELPERS
    ============================================================
-   Validates and normalises SVG and PNG assets before they are
-   handed to the Renderer or stored.  Does NOT merge into
-   IconModal or IconSanitizer.
-   ============================================================ */
-
-const AssetManager = (() => {
-
-    /** Max PNG file size accepted for storage (post-resize the data URL
-     *  will be much smaller, but we gate the raw upload here). */
-    const MAX_PNG_BYTES = 4 * 1024 * 1024;  // 4 MB
-    /** Maximum icon dimension in pixels after PNG normalisation. */
-    const PNG_RENDER_DIM = 128;
-
-    /**
-     * Validate and normalise a raw SVG string.
-     * Returns a renderer-ready asset object.
-     * @param  {string} raw
-     * @returns {{ type:"svg", data:string }}
-     * @throws {Error}
-     */
-    function normalizeSVG(raw) {
-        // Sanitize without an ID prefix — namespacing happens at render time.
-        const clean = IconSanitizer.sanitize(raw);
-        return { type: "svg", data: clean };
-    }
-
-    /**
-     * Validate and normalise a PNG/JPEG/WebP File.
-     * Uses createImageBitmap for off-thread decode, then draws to canvas.
-     * Returns a data-URL-backed asset object.
-     * @param  {File} file
-     * @returns {Promise<{ type:"png", data:string }>}
-     */
-    function normalizePNG(file) {
-        return new Promise((resolve, reject) => {
-            if (file.type === "image/svg+xml") {
-                reject(new Error("Use the SVG tab for SVG files.")); return;
-            }
-            if (!file.type.startsWith("image/")) {
-                reject(new Error("File is not a recognised image format.")); return;
-            }
-            if (file.size > MAX_PNG_BYTES) {
-                reject(new Error(`Image exceeds 4 MB limit (${(file.size/1048576).toFixed(1)} MB).`)); return;
-            }
-
-            // createImageBitmap decodes off the main thread (where supported)
-            // and avoids the base64 round-trip of FileReader.readAsDataURL.
-            const objectURL = URL.createObjectURL(file);
-            createImageBitmap(file)
-                .then(bitmap => {
-                    URL.revokeObjectURL(objectURL);
-                    const scale = Math.min(1, PNG_RENDER_DIM / Math.max(bitmap.width, bitmap.height));
-                    const w     = Math.max(1, Math.round(bitmap.width  * scale));
-                    const h     = Math.max(1, Math.round(bitmap.height * scale));
-
-                    const canvas = document.createElement("canvas");
-                    canvas.width  = w;
-                    canvas.height = h;
-                    canvas.getContext("2d").drawImage(bitmap, 0, 0, w, h);
-                    bitmap.close();   // free GPU/memory resource immediately
-
-                    resolve({ type: "png", data: canvas.toDataURL("image/png") });
-                })
-                .catch(() => {
-                    // createImageBitmap not available or decode failed — fall back
-                    URL.revokeObjectURL(objectURL);
-                    const reader    = new FileReader();
-                    reader.onerror  = () => reject(new Error("Failed to read file."));
-                    reader.onload   = (e) => {
-                        const img    = new Image();
-                        img.onerror  = () => reject(new Error("Image could not be decoded."));
-                        img.onload   = () => {
-                            const scale = Math.min(1, PNG_RENDER_DIM / Math.max(img.width, img.height));
-                            const w     = Math.max(1, Math.round(img.width  * scale));
-                            const h     = Math.max(1, Math.round(img.height * scale));
-                            const canvas = document.createElement("canvas");
-                            canvas.width  = w;
-                            canvas.height = h;
-                            canvas.getContext("2d").drawImage(img, 0, 0, w, h);
-                            resolve({ type: "png", data: canvas.toDataURL("image/png") });
-                        };
-                        img.src = e.target.result;
-                    };
-                    reader.readAsDataURL(file);
-                });
-        });
-    }
-
-    /**
-     * Build a preview DOM element for insertion into .swift-preview-tile.
-     * Uses a fixed 44 px size — matches default icon dimensions.
-     * @param  {{ type:string, data:string }} asset
-     * @returns {HTMLElement}
-     */
-    function preparePreview(asset) {
-        if (asset.type === "svg") {
-            const wrap = document.createElement("div");
-            wrap.className = "custom-icon-wrapper custom-icon-wrapper--svg";
-            wrap.innerHTML = asset.data;
-            const svgEl = wrap.querySelector("svg");
-            if (svgEl) {
-                svgEl.style.cssText = "display:block;width:44px;height:44px;flex-shrink:0;";
-            }
-            return wrap;
-        }
-
-        if (asset.type === "png") {
-            const wrap = document.createElement("div");
-            wrap.className = "custom-icon-wrapper custom-icon-wrapper--png";
-            const img      = document.createElement("img");
-            img.src        = asset.data;
-            img.alt        = "";
-            img.draggable  = false;
-            img.style.cssText = "display:block;width:44px;height:44px;object-fit:contain;flex-shrink:0;";
-            wrap.appendChild(img);
-            return wrap;
-        }
-
-        throw new Error(`Unknown asset type: "${asset.type}"`);
-    }
-
-    return { normalizeSVG, normalizePNG, preparePreview };
-
-})();
-
-
-/* ============================================================
-   HELPERS
+   Small, centralized Vivaldi-DOM-specific lookups. If Vivaldi's
+   Speed Dial markup changes, these are the functions to update —
+   nothing else in the file re-derives them independently.
    ============================================================ */
 
 /**
  * Return the icon host container for a tile.
- * Single combined selector — one DOM traversal instead of two.
  * @param   {Element} tile
  * @returns {Element|null}
  */
@@ -572,14 +261,15 @@ function getContainer(tile) {
 
 /**
  * Return a tile's Vivaldi-assigned data-id, or null.
+ * Cards can be reordered, recreated, or moved — data-id is the
+ * stable per-card identity, never DOM position or title text.
  * @param   {Element} tile
  * @returns {string|null}
  */
 function getTileId(tile) { return tile.dataset.id || null; }
 
 /**
- * Generate a safe ID namespace prefix from a tile ID.
- * Deterministic so the same tile always gets the same prefix.
+ * Deterministic SVG ID-namespace prefix for a tile.
  * @param {string} tileId
  * @returns {string}
  */
@@ -590,27 +280,422 @@ function _idPrefix(tileId) {
     return `sd4-${slug}-`;
 }
 
+function isRegularSpeedDial(tile) {
+    // Folders get their own preview thumbnail (a grid of their children's
+    // favicons). We never touch that — see SpeedDialUrlResolver notes on
+    // folders below.
+    return tile.classList.contains("SpeedDial--Icon")
+        && !tile.classList.contains("folder");
+}
+
+
+/* ============================================================
+   SpeedDialUrlResolver
+   ============================================================
+   Vivaldi's Speed Dial cards do not reliably expose an <a href>.
+   The one thing every regular (non-folder) tile does expose is
+   its native favicon, whose src/srcset encodes the target page:
+
+       chrome://favicon2/?size=32&pageUrl=https://github.com/
+
+   Strategy, in order:
+     1. Explicit data-url / data-uri / data-href / href, in case a
+        future Vivaldi build (or another mod) provides one directly.
+     2. pageUrl extracted from the native favicon's srcset.
+     3. Give up — the tile keeps its native favicon, untouched.
+
+   Folders are skipped entirely: they have no single target URL,
+   and their favicon container renders a grid of child favicons,
+   not one site's icon — there is nothing here for the automatic
+   pipeline to correctly attach to.
+   ============================================================ */
+
+const SpeedDialUrlResolver = (() => {
+
+    function resolve(tile) {
+        if (!isRegularSpeedDial(tile)) return null;
+        return _fromAttributes(tile) || _fromFavicon(tile) || null;
+    }
+
+    function _fromAttributes(tile) {
+        const raw =
+            tile.dataset.url ||
+            tile.dataset.uri ||
+            tile.dataset.href ||
+            tile.getAttribute("href");
+        return _clean(raw);
+    }
+
+    function _fromFavicon(tile) {
+        const img = tile.querySelector(
+            ":scope > .thumbnail-favicon > img.favicon, :scope .thumbnail-favicon img.favicon"
+        );
+        const srcset = img?.getAttribute("srcset") || img?.srcset;
+        if (!srcset) return null;
+
+        // srcset is a comma-separated candidate list, each
+        // "<url> <descriptor>" (e.g. "chrome://favicon2/?...=64 64w").
+        // Every candidate points at the same page — the first is enough.
+        for (const candidate of srcset.split(",")) {
+            const url = candidate.trim().split(/\s+/)[0];
+            if (!url) continue;
+
+            const pageUrl = _extractPageUrl(url);
+            const cleaned = _clean(pageUrl);
+            if (cleaned) return cleaned;
+        }
+        return null;
+    }
+
+    function _extractPageUrl(faviconUrl) {
+        try {
+            return new URL(faviconUrl, location.href).searchParams.get("pageUrl");
+        } catch {
+            // Defensive fallback only — chrome://favicon2 URLs parse fine
+            // with the URL constructor in practice, but never let a parser
+            // edge case break icon resolution for every other tile too.
+            const m = /[?&]pageUrl=([^&]+)/.exec(faviconUrl);
+            return m ? decodeURIComponent(m[1]) : null;
+        }
+    }
+
+    function _clean(raw) {
+        if (!raw) return null;
+        try {
+            const u = new URL(raw);
+            if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+            return u.href;
+        } catch {
+            return null;
+        }
+    }
+
+    return { resolve };
+
+})();
+
+
+/* ============================================================
+   DomainNormalizer
+   ============================================================
+   URL → apex-ish domain used as the cache/lookup key.
+
+   This intentionally stops short of a full Public Suffix List
+   (that's a large, frequently-updated dataset for a problem this
+   feature only needs an approximate answer to). It handles the
+   plain case (labels.length <= 2) exactly, and the handful of
+   extremely common "co.uk"-shaped second-level ccTLDs explicitly.
+   Anything more exotic falls back to the naive last-two-labels
+   guess, which just means a brand lookup for a rare ccTLD may
+   occasionally use a slightly-too-broad domain — worst case is a
+   negative cache entry, not a wrong icon on someone else's tile.
+   ============================================================ */
+
+const DomainNormalizer = (() => {
+
+    const CC_SECOND_LEVEL = new Set([
+        "co.uk", "org.uk", "gov.uk", "ac.uk",
+        "co.jp", "co.in", "co.nz", "co.za", "co.kr",
+        "com.au", "com.br", "com.mx", "com.tr", "com.sg", "com.hk",
+    ]);
+
+    function normalize(rawUrl) {
+        let host;
+        try {
+            host = new URL(rawUrl).hostname.toLowerCase();
+        } catch {
+            return null;
+        }
+        if (!host) return null;
+
+        host = host.replace(/^www\./, "");
+        return _apex(host);
+    }
+
+    function _apex(host) {
+        const labels = host.split(".").filter(Boolean);
+        if (labels.length <= 2) return host;
+
+        const lastTwo = labels.slice(-2).join(".");
+        if (CC_SECOND_LEVEL.has(lastTwo) && labels.length >= 3) {
+            return labels.slice(-3).join(".");
+        }
+        return lastTwo;
+    }
+
+    return { normalize };
+
+})();
+
+
+/* ============================================================
+   BrandResolver
+   ============================================================
+   Domain → ordered list of theSVG slug candidates.
+
+   Most domains need no mapping at all — "github.com" → "github"
+   falls straight out of the apex label. The alias table exists
+   only for the handful of cases where the domain's first label
+   and the brand's actual slug diverge.
+   ============================================================ */
+
+const BrandResolver = (() => {
+
+    const ALIASES = new Map([
+        ["x.com", "twitter"],
+    ]);
+
+    function candidates(domain) {
+        const out = [];
+        if (ALIASES.has(domain)) out.push(ALIASES.get(domain));
+
+        const label = domain.split(".")[0];
+        if (label && !out.includes(label)) out.push(label);
+
+        return out;
+    }
+
+    return { candidates };
+
+})();
+
+
+/* ============================================================
+   TheSvgProvider
+   ============================================================
+   Talks to theSVG's public, unauthenticated static CDN:
+       https://thesvg.org/icons/{slug}/{variant}.svg
+   with the jsDelivr mirror as a fallback host when the primary
+   host errors (not when it 404s — a 404 means "no such icon",
+   not "host is unreachable", and retrying the same lookup on a
+   mirror won't change that).
+
+   Only the normalized domain (never a full URL, path, or query
+   string) is ever used to build a request — see the module
+   header for the rest of the privacy rationale.
+
+   Every branch below returns a tri-state result so the caller
+   can distinguish "confirmed no icon" from "couldn't check" —
+   see IconService for why that distinction drives different
+   cache lifetimes.
+   ============================================================ */
+
+const TheSvgProvider = (() => {
+
+    const PRIMARY_BASE = "https://thesvg.org/icons";
+    const MIRROR_BASE  = "https://cdn.jsdelivr.net/gh/glincker/thesvg@main/public/icons";
+    const VARIANTS     = ["default", "color", "mono"];
+    const FETCH_TIMEOUT_MS = 5000;
+    const MAX_RESPONSE_BYTES = 200_000; // reject anything implausibly large for a brand glyph
+
+    /**
+     * @param   {string} domain — normalized apex domain
+     * @returns {Promise<{status:"success",svg:string}|{status:"not-found"}|{status:"error"}>}
+     */
+    async function lookup(domain) {
+        const slugs = BrandResolver.candidates(domain);
+        let sawError = false;
+
+        for (const slug of slugs) {
+            for (const variant of VARIANTS) {
+                const path = `/${encodeURIComponent(slug)}/${variant}.svg`;
+
+                const primary = await _tryFetch(PRIMARY_BASE + path);
+                if (primary.status === "success") return primary;
+                if (primary.status === "error") {
+                    sawError = true;
+                    const mirror = await _tryFetch(MIRROR_BASE + path);
+                    if (mirror.status === "success") return mirror;
+                }
+            }
+        }
+
+        return { status: sawError ? "error" : "not-found" };
+    }
+
+    async function _tryFetch(url) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
+        try {
+            const res = await fetch(url, {
+                signal:          controller.signal,
+                credentials:     "omit",
+                referrerPolicy:  "no-referrer",
+                mode:            "cors",
+            });
+
+            if (res.status === 404) return { status: "not-found" };
+            if (!res.ok)             return { status: "error" };
+
+            const text = await res.text();
+            if (!text || text.length > MAX_RESPONSE_BYTES) return { status: "error" };
+
+            // A 200 response that isn't actually SVG (rate-limit page,
+            // HTML error page masquerading as 200, etc.) must never be
+            // treated as "found" — sniff before we even try to parse it.
+            if (!/^\uFEFF?\s*(<\?xml|<svg)/i.test(text)) return { status: "not-found" };
+
+            let clean;
+            try {
+                clean = IconSanitizer.sanitize(text);
+            } catch {
+                // Fetched something SVG-shaped that failed sanitization —
+                // treat as unusable rather than caching it as a success.
+                return { status: "error" };
+            }
+
+            return { status: "success", svg: clean };
+        } catch {
+            return { status: "error" };
+        } finally {
+            clearTimeout(timer);
+        }
+    }
+
+    return { lookup };
+
+})();
+
+
+/* ============================================================
+   IconService
+   ============================================================
+   Layered cache in front of TheSvgProvider:
+     in-memory Map  → chrome.storage.local  → provider lookup
+
+   Also de-duplicates concurrent lookups for the same domain
+   (e.g. three Speed Dials all pointing at github.com trigger
+   exactly one network request, not three).
+
+   Cache is keyed by domain, not by tile — icon identity belongs
+   to the website, not to any one Speed Dial card.
+   ============================================================ */
+
+const IconService = (() => {
+
+    const CACHE_KEY      = "vivaldi_swift_auto_icons";
+    const CACHE_VERSION  = 1;
+    const MAX_ENTRIES    = 800;   // evict oldest by updatedAt beyond this
+    const MAX_PERSIST_SVG_BYTES = 60_000; // larger icons still render this
+                                           // session but aren't persisted —
+                                           // see _persistable() below
+
+    /** @type {Map<string, {status:string, svg?:string, updatedAt:number}>} */
+    const _mem = new Map();
+    /** @type {Map<string, Promise<object>>} */
+    const _inflight = new Map();
+
+    let _persistTimer = null;
+
+    async function init() {
+        try {
+            const result = await chrome.storage.local.get(CACHE_KEY);
+            const raw = result[CACHE_KEY];
+            if (raw && raw.version === CACHE_VERSION && raw.domains && typeof raw.domains === "object") {
+                for (const [domain, entry] of Object.entries(raw.domains)) {
+                    if (_validEntry(entry)) _mem.set(domain, entry);
+                }
+            }
+            console.log(`[Vivaldi Swift] Auto-icon cache hydrated — ${_mem.size} domain(s).`);
+        } catch (e) {
+            console.error("[Vivaldi Swift] Auto-icon cache init failed:", e);
+        }
+    }
+
+    function _validEntry(entry) {
+        if (!entry || typeof entry !== "object") return false;
+        if (!["success", "not-found", "error"].includes(entry.status)) return false;
+        if (!Number.isFinite(entry.updatedAt)) return false;
+        if (entry.status === "success" && typeof entry.svg !== "string") return false;
+        return true;
+    }
+
+    function _ttlFor(status) {
+        if (status === "success")   return POSITIVE_CACHE_TTL_MS;
+        if (status === "not-found") return NEGATIVE_CACHE_TTL_MS;
+        return ERROR_CACHE_TTL_MS;
+    }
+
+    function _isFresh(entry) {
+        return (Date.now() - entry.updatedAt) < _ttlFor(entry.status);
+    }
+
+    function _schedulePersist() {
+        if (_persistTimer) return;
+        _persistTimer = setTimeout(() => {
+            _persistTimer = null;
+            _persist();
+        }, 500);
+    }
+
+    function _persist() {
+        // Evict oldest entries beyond MAX_ENTRIES before writing.
+        if (_mem.size > MAX_ENTRIES) {
+            const sorted = [..._mem.entries()].sort((a, b) => a[1].updatedAt - b[1].updatedAt);
+            const toDrop = sorted.slice(0, _mem.size - MAX_ENTRIES);
+            for (const [domain] of toDrop) _mem.delete(domain);
+        }
+
+        const domains = {};
+        for (const [domain, entry] of _mem.entries()) {
+            domains[domain] = _persistable(entry);
+        }
+
+        chrome.storage.local
+            .set({ [CACHE_KEY]: { version: CACHE_VERSION, domains } })
+            .catch(e => console.error("[Vivaldi Swift] Auto-icon cache persist failed:", e));
+    }
+
+    /** Drop oversized SVG payloads from the persisted copy; keep them in memory. */
+    function _persistable(entry) {
+        if (entry.status === "success" && entry.svg && entry.svg.length > MAX_PERSIST_SVG_BYTES) {
+            return { status: "error", updatedAt: entry.updatedAt };
+        }
+        return entry;
+    }
+
+    /**
+     * @param   {string} domain
+     * @returns {Promise<{status:string, svg?:string}>}
+     */
+    function resolve(domain) {
+        const cached = _mem.get(domain);
+        if (cached && _isFresh(cached)) return Promise.resolve(cached);
+
+        if (_inflight.has(domain)) return _inflight.get(domain);
+
+        const p = TheSvgProvider.lookup(domain)
+            .catch(() => ({ status: "error" }))
+            .then(result => {
+                const entry = { status: result.status, svg: result.svg, updatedAt: Date.now() };
+                _mem.set(domain, entry);
+                _schedulePersist();
+                return entry;
+            })
+            .finally(() => _inflight.delete(domain));
+
+        _inflight.set(domain, p);
+        return p;
+    }
+
+    return { init, resolve };
+
+})();
+
 
 /* ============================================================
    Renderer
    ============================================================
-   renderLayoutWrapper()  Create .custom-layout-wrapper.
-   renderSVG()            Create .custom-icon-wrapper with inline SVG.
-   renderPNG()            Create .custom-icon-wrapper with <img>.
-   applyLayout()          Set --custom-padding / --custom-wrapper-scale
-                          on the layout wrapper.
-   applyTransforms()      Set --custom-icon-size / --custom-icon-offset-*
-                          on the icon wrapper.
-
-   RULE: Neither applyLayout nor applyTransforms may touch
-   .SpeedDial or any of its native attributes.
+   Builds the injected wrapper hierarchy. No per-tile layout
+   customization exists anymore — the wrapper always centers its
+   icon at a fixed size via CSS custom-property defaults, so this
+   module has nothing left to configure per tile beyond the SVG
+   content itself.
    ============================================================ */
 
 const Renderer = (() => {
 
-    /* Styles applied to .custom-layout-wrapper at injection time.
-       Lives inside .thumbnail-favicon (position:static, overflow:hidden)
-       so injectTile() first promotes the container to position:relative. */
     const LAYOUT_WRAPPER_BASE = {
         position:        "absolute",
         inset:           "0",
@@ -618,24 +703,22 @@ const Renderer = (() => {
         alignItems:      "center",
         justifyContent:  "center",
         pointerEvents:   "none",
+        userSelect:      "none",
         zIndex:          "1",
         overflow:        "visible",
     };
 
-    /* Styles applied to .custom-icon-wrapper.
-       It is a flex-child of the layout wrapper, NOT absolutely positioned.
-       Width / height are driven by --custom-icon-size via CSS. */
     const ICON_WRAPPER_BASE = {
-        position:    "relative",
-        display:     "flex",
-        alignItems:  "center",
+        position:       "relative",
+        display:        "flex",
+        alignItems:     "center",
         justifyContent: "center",
-        pointerEvents: "none",
-        flexShrink:  "0",
-        overflow:    "visible",
+        pointerEvents:  "none",
+        userSelect:     "none",
+        flexShrink:     "0",
+        overflow:       "visible",
     };
 
-    /** Create an empty .custom-layout-wrapper. */
     function renderLayoutWrapper() {
         const wrap     = document.createElement("div");
         wrap.className = "custom-layout-wrapper";
@@ -644,864 +727,123 @@ const Renderer = (() => {
     }
 
     /**
-     * Create a .custom-icon-wrapper containing an inline SVG.
-     * IDs are namespaced by idPrefix to avoid global collisions.
+     * @param {string} svgString — already sanitized
+     * @param {string} idPrefix
      */
     function renderSVG(svgString, idPrefix) {
         const wrap     = document.createElement("div");
         wrap.className = "custom-icon-wrapper custom-icon-wrapper--svg";
         Object.assign(wrap.style, ICON_WRAPPER_BASE);
         wrap.innerHTML = svgString;
+        wrap.setAttribute("aria-hidden", "true"); // decorative — tile title carries the accessible name
 
         const svgEl = wrap.querySelector("svg");
         if (svgEl) {
             svgEl.style.cssText = "display:block;width:100%;height:100%;flex-shrink:0;";
-            if (idPrefix) _namespaceInPlace(svgEl, idPrefix);
+            if (idPrefix) IconSanitizer.namespaceIds(svgEl, idPrefix);
         }
 
         return wrap;
     }
 
-    /**
-     * Apply ID namespacing to a live SVG element already in the page DOM.
-     * The SVG is already sanitized — skip the full sanitize round-trip and
-     * call the namespace pass directly.  This eliminates:
-     *   XMLSerializer → full sanitize (parse + walk + serialize) → DOMParser
-     * and replaces it with a single in-place DOM mutation pass.
-     */
-    function _namespaceInPlace(svgEl, prefix) {
-        IconSanitizer.namespaceIds(svgEl, prefix);
-    }
-
-    /** Create a .custom-icon-wrapper containing an <img> for PNG assets. */
-    function renderPNG(dataUrl) {
-        const wrap     = document.createElement("div");
-        wrap.className = "custom-icon-wrapper custom-icon-wrapper--png";
-        Object.assign(wrap.style, ICON_WRAPPER_BASE);
-
-        const img      = document.createElement("img");
-        img.src        = dataUrl;
-        img.alt        = "";
-        img.draggable  = false;
-        img.style.cssText = "display:block;width:100%;height:100%;object-fit:contain;flex-shrink:0;";
-        wrap.appendChild(img);
-        return wrap;
-    }
-
-    /**
-     * Apply layout properties to the .custom-layout-wrapper
-     * exclusively via CSS custom properties.
-     * NEVER called on .SpeedDial.
-     * @param {HTMLElement} layoutWrapper
-     * @param {object}      layout
-     */
-    function applyLayout(layoutWrapper, layout) {
-        if (!layoutWrapper || !layout) return;
-        layoutWrapper.style.setProperty(
-            "--custom-padding",       `${layout.thumbnailPadding || 0}px`
-        );
-        layoutWrapper.style.setProperty(
-            "--custom-wrapper-scale", String(layout.wrapperScale || 1.0)
-        );
-    }
-
-    /**
-     * Apply icon-level transforms to the .custom-icon-wrapper
-     * exclusively via CSS custom properties.
-     * @param {HTMLElement} iconWrapper
-     * @param {object}      layout
-     */
-    function applyTransforms(iconWrapper, layout) {
-        if (!iconWrapper || !layout) return;
-        iconWrapper.style.setProperty(
-            "--custom-icon-size",     `${layout.iconSize    || 44}px`
-        );
-        iconWrapper.style.setProperty(
-            "--custom-icon-offset-x", `${layout.iconOffsetX || 0}px`
-        );
-        iconWrapper.style.setProperty(
-            "--custom-icon-offset-y", `${layout.iconOffsetY || 0}px`
-        );
-    }
-
-    return { renderLayoutWrapper, renderSVG, renderPNG, applyLayout, applyTransforms };
+    return { renderLayoutWrapper, renderSVG };
 
 })();
 
 
 /* ============================================================
-   INJECTION ENGINE
+   AutoIconController
    ============================================================
-   injectTile()   — idempotent; builds wrapper hierarchy.
-   reinjectTile() — clears guard, tears down wrappers, re-injects.
-   scanTiles()    — iterates every .SpeedDial in the document.
+   Orchestrates one tile: resolve URL → normalize domain → cache/
+   provider lookup → render. Progressive enhancement throughout —
+   the native favicon stays fully interactive and visible until
+   (and unless) a validated replacement is ready to swap in.
 
-   RULE: injectTile never reads or writes .SpeedDial.style.
-   All customisation targets .thumbnail-favicon and its children.
+   State tracking uses a WeakSet rather than a DOM attribute:
+   this is pure implementation bookkeeping with no CSS or
+   debugging value, and a WeakSet correctly "forgets" a tile if
+   Vivaldi ever recreates the underlying element, which a DOM
+   attribute surviving on a stale node would not.
    ============================================================ */
 
-/**
- * Inject the wrapper hierarchy into a single tile.
- * Structure after injection:
- *   .thumbnail-favicon (position:relative)
- *     .custom-layout-wrapper  (abs fill, CSS vars: padding, scale)
- *       .custom-icon-wrapper  (flex child, CSS vars: size, offsets)
- *         svg | img
- *
- * @param {Element} tile — .SpeedDial element
- */
-function injectTile(tile) {
-    if (tile.dataset.sdInjected) return;
+const AutoIconController = (() => {
 
-    const tileId = getTileId(tile);
-    if (!tileId) return;
+    /** Tiles whose async resolution has already been kicked off. */
+    const _started = new WeakSet();
 
-    tile.dataset.sdInjected = "1";
+    function process(tile) {
+        if (!isRegularSpeedDial(tile)) return;
+        if (_started.has(tile)) return;
+        _started.add(tile);
 
-    const record = StorageManager.get(tileId);
-    if (!record?.icon) return;   // No custom icon — leave native favicon alone.
+        const url = SpeedDialUrlResolver.resolve(tile);
+        if (!url) return; // no recoverable URL — native favicon stands, nothing more to do
 
-    const container = getContainer(tile);
-    if (!container) return;
+        const domain = DomainNormalizer.normalize(url);
+        if (!domain) return;
 
-    // .thumbnail-favicon is position:static by default;
-    // promote to relative so our absolute wrapper is contained by it.
-    container.style.position = "relative";
-
-    // Hide native favicon.
-    const favicon = tile.querySelector(".favicon");
-    if (favicon) favicon.style.opacity = "0";
-
-    // Suppress folder preview children.
-    const folderKids = container.querySelector(".thumbnail-favicon-children");
-    if (folderKids) {
-        folderKids.style.opacity       = "0";
-        folderKids.style.pointerEvents = "none";
+        IconService.resolve(domain)
+            .then(result => _apply(tile, domain, result))
+            .catch(e => console.warn("[Vivaldi Swift] Auto-icon lookup failed:", e));
     }
 
-    // Remove any prior injection.
-    container.querySelector(".custom-layout-wrapper")?.remove();
-    container.querySelector(".custom-icon-wrapper")?.remove();
-    container.querySelector(".custom-svg-icon")?.remove();
+    function _apply(tile, expectedDomain, result) {
+        if (result.status !== "success") return; // not-found / error → native favicon stands
 
-    // Build the hierarchy.
-    const layoutWrapper = Renderer.renderLayoutWrapper();
-    const icon          = record.icon;
-    const prefix        = _idPrefix(tileId);
-    const iconWrapper   = (icon.type === "svg")
-        ? Renderer.renderSVG(icon.data, prefix)
-        : Renderer.renderPNG(icon.data);
+        // The async lookup may have outlived the tile (removed, or Vivaldi
+        // recycled this element for a different card while we were
+        // fetching). Re-check both connectivity and identity before
+        // touching the DOM.
+        if (!tile.isConnected) return;
+        const stillSameCard = SpeedDialUrlResolver.resolve(tile);
+        if (!stillSameCard || DomainNormalizer.normalize(stillSameCard) !== expectedDomain) return;
 
-    layoutWrapper.appendChild(iconWrapper);
-    container.appendChild(layoutWrapper);
+        const container = getContainer(tile);
+        if (!container) return;
 
-    // Apply layout via CSS custom properties — zero card-level side effects.
-    const layout = record.layout || StorageManager.defaultLayout();
-    Renderer.applyLayout(layoutWrapper, layout);
-    Renderer.applyTransforms(iconWrapper, layout);
-}
+        // Avoid double-injection if this tile is somehow processed twice
+        // (e.g. a fresh element with the same identity after a re-render).
+        if (container.querySelector(".custom-layout-wrapper")) return;
 
-/**
- * Clear injection state, remove wrappers, restore native state, re-inject.
- * Call after StorageManager writes to apply changes to the live DOM.
- * NEVER modifies .SpeedDial.style — Vivaldi owns the card.
- * @param {Element} tile
- */
-function reinjectTile(tile) {
-    delete tile.dataset.sdInjected;
+        // .thumbnail-favicon is position:static by default; promote to
+        // relative so our absolute layout wrapper is contained by it.
+        container.style.position = "relative";
 
-    const container = getContainer(tile);
-    if (container) {
-        container.querySelector(".custom-layout-wrapper")?.remove();
-        container.querySelector(".custom-icon-wrapper")?.remove();
-        container.querySelector(".custom-svg-icon")?.remove();
+        const layoutWrapper = Renderer.renderLayoutWrapper();
+        const iconWrapper   = Renderer.renderSVG(result.svg, _idPrefix(getTileId(tile) || expectedDomain));
+        layoutWrapper.appendChild(iconWrapper);
+        container.appendChild(layoutWrapper);
 
+        // The SVG was already fetched, validated, and sanitized as text
+        // before we ever got here — there is no async "did the image
+        // load" step the way there would be for an <img src="..."> or a
+        // blob URL, so hiding the native favicon can happen in the same
+        // synchronous block as the successful injection above.
         const favicon = tile.querySelector(".favicon");
-        if (favicon) favicon.style.opacity = "";
+        if (favicon) favicon.style.opacity = "0";
 
-        const folderKids = container.querySelector(".thumbnail-favicon-children");
-        if (folderKids) {
-            folderKids.style.opacity       = "";
-            folderKids.style.pointerEvents = "";
+        tile.dataset.vivaldiSwiftIcon = "auto"; // debugging/CSS hook only, not a state gate
+    }
+
+    function processAll() {
+        for (const tile of document.querySelectorAll(".SpeedDial")) {
+            process(tile);
         }
     }
 
-    injectTile(tile);
-}
-
-/**
- * Scan all .SpeedDial tiles in the document.
- * Synchronous — reads from in-memory StorageManager cache only.
- */
-function scanTiles() {
-    for (const tile of document.querySelectorAll(".SpeedDial")) {
-        injectTile(tile);
-    }
-}
-
-
-/* ============================================================
-   PHASE 6 — IconModal  (dual SVG / PNG)
-   ============================================================
-   Self-contained modal lifecycle with two-tab picker flow.
-   Both SVG and PNG paths converge into the same preview + apply
-   pipeline via AssetManager.
-   ============================================================ */
-
-const IconModal = (() => {
-
-    let _el           = null;
-    let _activeTile   = null;
-    let _pendingAsset = null;  // { type, data } awaiting Apply
-    let _activeTab    = "svg"; // "svg" | "png"
-
-    /** Cached DOM element refs — populated once at init(), never repeated. */
-    let _dom = null;
-
-    function init() {
-        _el = _buildDOM();
-        document.body.appendChild(_el);
-        _cacheDOM();
-        _bindEvents();
-    }
-
-    /** Cache all static element references after DOM is built. */
-    function _cacheDOM() {
-        _dom = {
-            overlay:     _el,
-            dialog:      _el.querySelector(".swift-modal-dialog"),
-            title:       _el.querySelector("#swift-modal-title"),
-            closeBtn:    _el.querySelector("#swift-modal-close"),
-            tabBar:      _el.querySelector("#swift-tab-bar"),
-            pickerPane:  _el.querySelector("#swift-picker-pane"),
-            dropZone:    _el.querySelector("#swift-drop-zone"),
-            dropTitle:   _el.querySelector("#swift-drop-title"),
-            fileInput:   _el.querySelector("#swift-file-input"),
-            previewPane: _el.querySelector("#swift-preview-pane"),
-            previewTile: _el.querySelector("#swift-preview-tile"),
-            validation:  _el.querySelector("#swift-validation"),
-            reselectBtn: _el.querySelector("#swift-reselect-btn"),
-            cancelBtn:   _el.querySelector("#swift-cancel-btn"),
-            applyBtn:    _el.querySelector("#swift-apply-btn"),
-        };
-    }
-
-    /* ── DOM construction ──────────────────────────────────── */
-
-    function _buildDOM() {
-        const el     = document.createElement("div");
-        el.id        = "swift-icon-modal";
-        el.className = "swift-modal-overlay";
-
-        el.innerHTML = `
-<div class="swift-modal-dialog" role="dialog" aria-modal="true"
-     aria-labelledby="swift-modal-title" tabindex="-1">
-
-  <div class="swift-modal-header">
-    <h2 class="swift-modal-title" id="swift-modal-title">Change Icon</h2>
-    <button class="swift-modal-close" id="swift-modal-close" aria-label="Close">
-      <svg viewBox="0 0 14 14" fill="none">
-        <path d="M1 1l12 12M13 1L1 13" stroke="currentColor"
-              stroke-width="1.75" stroke-linecap="round"/>
-      </svg>
-    </button>
-  </div>
-
-  <div class="swift-tab-bar" id="swift-tab-bar" role="tablist">
-    <button class="swift-tab swift-tab--active" id="swift-tab-svg"
-            role="tab" aria-selected="true" data-tab="svg">
-      <svg class="swift-tab-icon" viewBox="0 0 14 14" fill="none">
-        <rect x="1" y="1" width="12" height="12" rx="1.5"
-              stroke="currentColor" stroke-width="1.2"/>
-        <path d="M4 9l2-4 2 4M9 5v4"
-              stroke="currentColor" stroke-width="1.2"
-              stroke-linecap="round" stroke-linejoin="round"/>
-      </svg>
-      SVG
-    </button>
-    <button class="swift-tab" id="swift-tab-png"
-            role="tab" aria-selected="false" data-tab="png">
-      <svg class="swift-tab-icon" viewBox="0 0 14 14" fill="none">
-        <rect x="1" y="1" width="12" height="12" rx="1.5"
-              stroke="currentColor" stroke-width="1.2"/>
-        <circle cx="4.5" cy="4.5" r="1.2" fill="currentColor"/>
-        <path d="M1.5 9.5L4 7l2.5 2 2-2 4 4"
-              stroke="currentColor" stroke-width="1.2"
-              stroke-linecap="round" stroke-linejoin="round"/>
-      </svg>
-      PNG
-    </button>
-  </div>
-
-  <div class="swift-modal-body">
-
-    <div class="swift-picker-pane" id="swift-picker-pane">
-      <div class="swift-drop-zone" id="swift-drop-zone">
-        <svg class="swift-drop-icon" viewBox="0 0 56 56" fill="none">
-          <rect x="4" y="4" width="48" height="48" rx="10"
-                stroke="currentColor" stroke-width="1.5"
-                stroke-dasharray="5 4"/>
-          <path d="M28 18v20M19 28l9-10 9 10"
-                stroke="currentColor" stroke-width="2"
-                stroke-linecap="round" stroke-linejoin="round"/>
-        </svg>
-        <p class="swift-drop-title" id="swift-drop-title">Drop SVG file here</p>
-        <p class="swift-drop-sub">or browse from disk</p>
-        <label class="swift-btn swift-btn--secondary" for="swift-file-input">Browse…</label>
-        <input type="file" id="swift-file-input"
-               accept=".svg,image/svg+xml" aria-label="Select icon file">
-      </div>
-    </div>
-
-    <div class="swift-preview-pane" id="swift-preview-pane">
-      <div class="swift-preview-label">Preview</div>
-      <div class="swift-preview-tile" id="swift-preview-tile"></div>
-      <div class="swift-validation" id="swift-validation"></div>
-      <button class="swift-btn swift-btn--ghost swift-btn--sm"
-              id="swift-reselect-btn">Choose a different file</button>
-    </div>
-
-  </div>
-
-  <div class="swift-modal-footer">
-    <button class="swift-btn swift-btn--ghost"    id="swift-cancel-btn">Cancel</button>
-    <button class="swift-btn swift-btn--primary"  id="swift-apply-btn" disabled>Apply</button>
-  </div>
-
-</div>`;
-
-        return el;
-    }
-
-    /* ── Event binding (once at init) ──────────────────────── */
-
-    function _bindEvents() {
-        _dom.closeBtn.onclick    = close;
-        _dom.cancelBtn.onclick   = close;
-        _dom.applyBtn.onclick    = _apply;
-        _dom.reselectBtn.onclick = _resetPicker;
-
-        _dom.overlay.onclick = e => { if (e.target === _dom.overlay) close(); };
-
-        _dom.fileInput.onchange = e => {
-            const f = e.target.files[0];
-            if (f) _loadFile(f);
-        };
-
-        // Tab switching
-        _dom.tabBar.addEventListener("click", e => {
-            const tab = e.target.closest("[data-tab]");
-            if (tab) _switchTab(tab.dataset.tab);
-        });
-
-        // Drop zone
-        const dz = _dom.dropZone;
-        dz.addEventListener("click", e => {
-            if (!e.target.closest("label")) _dom.fileInput.click();
-        });
-        dz.addEventListener("dragover",  e => { e.preventDefault(); dz.classList.add("swift-drop-zone--active"); });
-        dz.addEventListener("dragleave", ()  => dz.classList.remove("swift-drop-zone--active"));
-        dz.addEventListener("drop",      e => {
-            e.preventDefault();
-            dz.classList.remove("swift-drop-zone--active");
-            const f = e.dataTransfer?.files[0];
-            if (f) _loadFile(f);
-        });
-
-        document.addEventListener("keydown", e => {
-            if (e.key === "Escape" && _dom.overlay.style.display !== "none") close();
-        });
-    }
-
-    /* ── Tab management ────────────────────────────────────── */
-
-    function _switchTab(tab) {
-        if (_activeTab === tab) return;
-        _activeTab = tab;
-
-        _dom.tabBar.querySelectorAll(".swift-tab").forEach(t => {
-            const active = t.dataset.tab === tab;
-            t.classList.toggle("swift-tab--active", active);
-            t.setAttribute("aria-selected", String(active));
-        });
-
-        if (tab === "svg") {
-            _dom.fileInput.accept = ".svg,image/svg+xml";
-            _dom.dropTitle.textContent = "Drop SVG file here";
-        } else {
-            _dom.fileInput.accept = ".png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp";
-            _dom.dropTitle.textContent = "Drop PNG / JPG file here";
-        }
-
-        _resetPicker();
-    }
-
-    /* ── Public lifecycle ──────────────────────────────────── */
-
-    /** Open modal for a given tile, pre-populating if icon exists. */
-    function open(tile) {
-        _activeTile   = tile;
-        _pendingAsset = null;
-        _activeTab    = "svg";
-
-        _dom.title.textContent = tile.classList.contains("folder")
-            ? "Change Folder Icon" : "Change Icon";
-
-        // Reset to SVG tab
-        _dom.tabBar.querySelectorAll(".swift-tab").forEach(t => {
-            const active = t.dataset.tab === "svg";
-            t.classList.toggle("swift-tab--active", active);
-            t.setAttribute("aria-selected", String(active));
-        });
-        _dom.fileInput.accept      = ".svg,image/svg+xml";
-        _dom.dropTitle.textContent = "Drop SVG file here";
-
-        // Pre-populate if custom icon already stored
-        const id       = getTileId(tile);
-        const existing = id ? StorageManager.getIcon(id) : null;
-
-        if (existing) {
-            _pendingAsset = existing;
-            _showPreview(existing);
-            _setValidation(
-                `Current custom ${existing.type.toUpperCase()} icon — browse to replace.`,
-                "info"
-            );
-            _dom.applyBtn.disabled = false;
-        } else {
-            _resetPicker();
-        }
-
-        _dom.overlay.style.display = "flex";
-        requestAnimationFrame(() => _dom.dialog?.focus?.());
-    }
-
-    /** Hide the modal and clear all transient state. */
-    function close() {
-        _dom.overlay.style.display = "none";
-        _activeTile                = null;
-        _pendingAsset              = null;
-    }
-
-    /* ── Private helpers ───────────────────────────────────── */
-
-    function _resetPicker() {
-        _pendingAsset                   = null;
-        _dom.pickerPane.style.display   = "";
-        _dom.previewPane.style.display  = "none";
-        _dom.applyBtn.disabled          = true;
-        _dom.fileInput.value            = "";
-        _dom.validation.textContent     = "";
-        _dom.validation.className       = "swift-validation";
-        _dom.previewTile.innerHTML      = "";
-    }
-
-    function _loadFile(file) {
-        if (_activeTab === "svg") {
-            const isSvg = file.name.toLowerCase().endsWith(".svg") ||
-                          file.type === "image/svg+xml";
-            if (!isSvg) {
-                _setValidation("Please select an SVG (.svg) file for this tab.", "error");
-                return;
-            }
-            const reader   = new FileReader();
-            reader.onload  = e => _processSVG(e.target.result);
-            reader.onerror = () => _setValidation("Failed to read file.", "error");
-            reader.readAsText(file);
-        } else {
-            _processPNG(file);
-        }
-    }
-
-    function _processSVG(raw) {
-        try {
-            const asset        = AssetManager.normalizeSVG(raw);
-            _pendingAsset      = asset;
-            _showPreview(asset);
-            _setValidation("SVG validated and ready to apply.", "success");
-            _dom.applyBtn.disabled = false;
-        } catch (err) {
-            _pendingAsset          = null;
-            _dom.applyBtn.disabled = true;
-            _dom.pickerPane.style.display  = "none";
-            _dom.previewPane.style.display = "flex";
-            _dom.previewTile.innerHTML     = "";
-            _setValidation(`Invalid SVG: ${err.message}`, "error");
-        }
-    }
-
-    async function _processPNG(file) {
-        _setValidation("Processing image…", "info");
-        _dom.pickerPane.style.display  = "none";
-        _dom.previewPane.style.display = "flex";
-        _dom.previewTile.innerHTML     = "";
-        _dom.applyBtn.disabled         = true;
-        try {
-            const asset        = await AssetManager.normalizePNG(file);
-            _pendingAsset      = asset;
-            _showPreview(asset);
-            _setValidation("Image validated and ready to apply.", "success");
-            _dom.applyBtn.disabled = false;
-        } catch (err) {
-            _pendingAsset = null;
-            _setValidation(`Invalid image: ${err.message}`, "error");
-        }
-    }
-
-    function _showPreview(asset) {
-        _dom.pickerPane.style.display  = "none";
-        _dom.previewPane.style.display = "flex";
-        _dom.previewTile.innerHTML     = "";
-        _dom.previewTile.appendChild(AssetManager.preparePreview(asset));
-    }
-
-    function _setValidation(message, type) {
-        _dom.validation.textContent = message;
-        _dom.validation.className   = `swift-validation swift-validation--${type}`;
-    }
-
-    /** Commit pending asset to storage and live-inject. */
-    function _apply() {
-        if (!_pendingAsset || !_activeTile) return;
-
-        const id = getTileId(_activeTile);
-        if (!id) {
-            _setValidation("Speed Dial has no ID — cannot save. Reload the page.", "error");
-            return;
-        }
-
-        StorageManager.setIcon(id, _pendingAsset);
-        reinjectTile(_activeTile);
-        close();
-    }
-
-    return { init, open, close };
+    return { process, processAll };
 
 })();
 
 
 /* ============================================================
-   EditingEngine
+   ContextMenu
    ============================================================
-   Operates EXCLUSIVELY on injected wrappers.
-   Never reads or writes .SpeedDial geometry.
-
-   Pointer Events drive two drag interactions:
-     icon-move   — translate icon within the thumbnail
-     icon-resize — scale icon diameter
-
-   A floating properties panel handles:
-     Icon size     (stepper, mirrors drag result)
-     Padding       (stepper — inset inside thumbnail)
-     Scale         (stepper — content scale of layout wrapper)
-
-   Draft state is held in memory throughout editing.
-   A single StorageManager.setLayout() is issued on commit().
-   ============================================================ */
-
-const EditingEngine = (() => {
-
-    let _tile        = null;
-    let _overlay     = null;   // handles appended to tile
-    let _panel       = null;   // floating properties panel
-    let _draft       = null;   // { tileId, layout: {...} }
-    let _ptStart     = null;   // { x, y } pointer origin
-    let _mode        = null;   // "icon-move" | "icon-resize"
-    let _docClickOff = null;
-    let _docKeyOff   = null;
-
-    /* ── CSS custom property names ─────────────────────────── */
-    const P_SIZE    = "--custom-icon-size";
-    const P_OFSX    = "--custom-icon-offset-x";
-    const P_OFSY    = "--custom-icon-offset-y";
-    const P_PAD     = "--custom-padding";
-    const P_SCALE   = "--custom-wrapper-scale";
-
-    /* ── Public ─────────────────────────────────────────────── */
-
-    function enter(tile) {
-        if (_tile === tile) return;
-        if (_tile) exit();
-
-        const tileId = getTileId(tile);   // cached — used twice below
-        _tile  = tile;
-        _draft = {
-            tileId,
-            layout: { ...StorageManager.getLayout(tileId) },
-        };
-
-        tile.classList.add("SpeedDial--editing");
-
-        _overlay = _buildOverlay(tile);
-        tile.appendChild(_overlay);
-        _overlay.addEventListener("pointerdown", _onHandleDown);
-
-        _panel = _buildPanel();
-        document.body.appendChild(_panel);
-        _positionPanel();
-        _panel.addEventListener("click", _onPanelClick);
-
-        document.querySelectorAll(".SpeedDial").forEach(t => {
-            if (t !== tile) t.classList.add("SpeedDial--muted");
-        });
-
-        _docClickOff = e => {
-            if (!_tile?.contains(e.target) && !_panel?.contains(e.target)) cancel();
-        };
-        _docKeyOff = e => {
-            if (e.key === "Escape") cancel();
-            if (e.key === "Enter")  commit();
-        };
-        setTimeout(() => {
-            document.addEventListener("click",   _docClickOff);
-            document.addEventListener("keydown", _docKeyOff);
-        }, 50);
-    }
-
-    function exit() {
-        if (!_tile) return;
-
-        _tile.classList.remove("SpeedDial--editing");
-        _overlay?.remove();  _overlay = null;
-        _panel?.remove();    _panel   = null;
-
-        document.querySelectorAll(".SpeedDial--muted").forEach(t =>
-            t.classList.remove("SpeedDial--muted")
-        );
-
-        document.removeEventListener("pointermove", _onPointerMove);
-        document.removeEventListener("pointerup",   _onPointerUp);
-        document.removeEventListener("click",       _docClickOff);
-        document.removeEventListener("keydown",     _docKeyOff);
-
-        _tile = _draft = _ptStart = _mode = null;
-    }
-
-    /** One storage write; apply final layout to live wrappers; exit. */
-    function commit() {
-        if (!_tile || !_draft) return;
-        StorageManager.setLayout(_draft.tileId, _draft.layout);
-        _applyDraftToDOM();
-        exit();
-    }
-
-    /** Restore from storage; discard draft; exit. */
-    function cancel() {
-        if (!_tile) return;
-        const stored = StorageManager.getLayout(getTileId(_tile));
-        _applyToDOM(stored);
-        exit();
-    }
-
-    /* ── Overlay (icon handles only) ────────────────────────── */
-
-    function _buildOverlay(tile) {
-        const ov     = document.createElement("div");
-        ov.className = "sd-edit-overlay";
-
-        if (tile.querySelector(".custom-icon-wrapper")) {
-            const im          = document.createElement("div");
-            im.className      = "sd-edit-icon-move";
-            im.dataset.editAction = "icon-move";
-            im.title          = "Drag to reposition icon";
-            ov.appendChild(im);
-
-            const ir          = document.createElement("div");
-            ir.className      = "sd-edit-icon-resize";
-            ir.dataset.editAction = "icon-resize";
-            ir.title          = "Drag to resize icon";
-            ov.appendChild(ir);
-        }
-
-        return ov;
-    }
-
-    /* ── Properties panel ───────────────────────────────────── */
-
-    function _buildPanel() {
-        const p     = document.createElement("div");
-        p.className = "sd-edit-panel";
-
-        p.innerHTML = `
-<div class="sd-edit-panel__header">
-  <span class="sd-edit-panel__title">Customize Layout</span>
-</div>
-<div class="sd-edit-panel__body">
-  <div class="sd-edit-row">
-    <span class="sd-edit-row__label">Icon size</span>
-    <div class="sd-edit-stepper">
-      <button class="sd-edit-stepper__btn" data-prop="iconSize" data-delta="-2">−</button>
-      <span   class="sd-edit-stepper__val" id="sd-val-iconSize">44px</span>
-      <button class="sd-edit-stepper__btn" data-prop="iconSize" data-delta="2">+</button>
-    </div>
-  </div>
-  <div class="sd-edit-row">
-    <span class="sd-edit-row__label">Padding</span>
-    <div class="sd-edit-stepper">
-      <button class="sd-edit-stepper__btn" data-prop="thumbnailPadding" data-delta="-2">−</button>
-      <span   class="sd-edit-stepper__val" id="sd-val-thumbnailPadding">0px</span>
-      <button class="sd-edit-stepper__btn" data-prop="thumbnailPadding" data-delta="2">+</button>
-    </div>
-  </div>
-  <div class="sd-edit-row">
-    <span class="sd-edit-row__label">Scale</span>
-    <div class="sd-edit-stepper">
-      <button class="sd-edit-stepper__btn" data-prop="wrapperScale" data-delta="-0.05">−</button>
-      <span   class="sd-edit-stepper__val" id="sd-val-wrapperScale">1.00×</span>
-      <button class="sd-edit-stepper__btn" data-prop="wrapperScale" data-delta="0.05">+</button>
-    </div>
-  </div>
-</div>
-<div class="sd-edit-panel__footer">
-  <button class="sd-edit-panel__btn sd-edit-panel__btn--cancel" data-panel-action="cancel">Cancel</button>
-  <button class="sd-edit-panel__btn sd-edit-panel__btn--commit" data-panel-action="commit">Apply</button>
-</div>`;
-
-        _syncPanel(p);
-        return p;
-    }
-
-    function _positionPanel() {
-        if (!_panel || !_tile) return;
-        const bcr   = _tile.getBoundingClientRect();
-        const left  = Math.min(Math.max(8, bcr.left), window.innerWidth  - 212);
-        const below = bcr.bottom + 10;
-        const above = bcr.top    - 186;
-        const top   = (below + 180 < window.innerHeight) ? below : Math.max(8, above);
-        _panel.style.cssText = `position:fixed;top:${top}px;left:${left}px;z-index:10002;`;
-    }
-
-    function _syncPanel(panel = _panel) {
-        if (!panel || !_draft) return;
-        const l = _draft.layout;
-        const q = (id) => panel.querySelector(id);
-        const s = q("#sd-val-iconSize");         if (s) s.textContent = `${l.iconSize ?? 44}px`;
-        const p = q("#sd-val-thumbnailPadding"); if (p) p.textContent = `${l.thumbnailPadding ?? 0}px`;
-        const w = q("#sd-val-wrapperScale");     if (w) w.textContent = `${(l.wrapperScale ?? 1).toFixed(2)}×`;
-    }
-
-    function _onPanelClick(e) {
-        const action = e.target.closest("[data-panel-action]")?.dataset.panelAction;
-        if (action === "commit") { commit(); return; }
-        if (action === "cancel") { cancel(); return; }
-
-        const btn = e.target.closest("[data-prop]");
-        if (!btn || !_draft) return;
-
-        const prop  = btn.dataset.prop;
-        const delta = parseFloat(btn.dataset.delta);
-        const l     = _draft.layout;
-
-        if      (prop === "iconSize") {
-            l.iconSize = Math.round(Math.max(16, Math.min(128, (l.iconSize ?? 44) + delta)));
-        } else if (prop === "thumbnailPadding") {
-            l.thumbnailPadding = Math.round(Math.max(0, Math.min(24, (l.thumbnailPadding ?? 0) + delta)));
-        } else if (prop === "wrapperScale") {
-            l.wrapperScale = parseFloat(
-                Math.max(0.5, Math.min(2.0, (l.wrapperScale ?? 1) + delta)).toFixed(2)
-            );
-        }
-
-        _applyDraftToDOM();
-        _syncPanel();
-    }
-
-    /* ── Apply helpers ──────────────────────────────────────── */
-
-    function _applyDraftToDOM() { _applyToDOM(_draft.layout); }
-
-    function _applyToDOM(layout) {
-        const lw = _tile?.querySelector(".custom-layout-wrapper");
-        const iw = _tile?.querySelector(".custom-icon-wrapper");
-        if (lw) Renderer.applyLayout(lw, layout);
-        if (iw) Renderer.applyTransforms(iw, layout);
-    }
-
-    /* ── Pointer handlers ───────────────────────────────────── */
-
-    function _onHandleDown(e) {
-        const el = e.target.closest("[data-edit-action]");
-        if (!el) return;
-
-        e.preventDefault();
-        e.stopPropagation();
-
-        _ptStart = { x: e.clientX, y: e.clientY };
-        _mode    = el.dataset.editAction;
-
-        _overlay.setPointerCapture(e.pointerId);
-        document.addEventListener("pointermove", _onPointerMove, { passive: false });
-        document.addEventListener("pointerup",   _onPointerUp,   { once: true });
-    }
-
-    function _onPointerMove(e) {
-        if (!_ptStart || !_mode) return;
-        const dx = e.clientX - _ptStart.x;
-        const dy = e.clientY - _ptStart.y;
-        if (_mode === "icon-move")   _previewIconMove(dx, dy);
-        if (_mode === "icon-resize") _previewIconResize(dx, dy);
-    }
-
-    function _onPointerUp(e) {
-        document.removeEventListener("pointermove", _onPointerMove);
-        if (!_ptStart || !_mode) return;
-
-        const dx = e.clientX - _ptStart.x;
-        const dy = e.clientY - _ptStart.y;
-        if (_mode === "icon-move")   _finaliseIconMove(dx, dy);
-        if (_mode === "icon-resize") _finaliseIconResize(dx, dy);
-
-        _syncPanel();
-        _ptStart = _mode = null;
-    }
-
-    /* ── Preview (live CSS vars, zero storage writes) ───────── */
-
-    function _previewIconMove(dx, dy) {
-        const iw = _tile?.querySelector(".custom-icon-wrapper");
-        if (!iw) return;
-        iw.style.setProperty(P_OFSX, `${(_draft.layout.iconOffsetX || 0) + dx}px`);
-        iw.style.setProperty(P_OFSY, `${(_draft.layout.iconOffsetY || 0) + dy}px`);
-    }
-
-    function _previewIconResize(dx, dy) {
-        const iw = _tile?.querySelector(".custom-icon-wrapper");
-        if (iw) iw.style.setProperty(P_SIZE, `${_calcIconSize(dx, dy)}px`);
-    }
-
-    /* ── Finalise (write to draft, not storage) ─────────────── */
-
-    function _finaliseIconMove(dx, dy) {
-        _draft.layout.iconOffsetX = (_draft.layout.iconOffsetX || 0) + dx;
-        _draft.layout.iconOffsetY = (_draft.layout.iconOffsetY || 0) + dy;
-    }
-
-    function _finaliseIconResize(dx, dy) {
-        _draft.layout.iconSize = _calcIconSize(dx, dy);
-    }
-
-    function _calcIconSize(dx, dy) {
-        return Math.round(Math.max(16, Math.min(128,
-            (_draft.layout.iconSize || 44) + (dx + dy) / 2
-        )));
-    }
-
-    return { enter, exit, commit, cancel };
-
-})();
-
-
-/* ============================================================
-   PHASE 5 — ContextMenu  (expanded)
-   ============================================================
-   Items:
-     Change Icon           (always)
-     Reset Icon            (only when custom icon exists)
-     ────────────────────
-     Remove Speed Dial     (always)
-     ────────────────────
-     Customize Layout      (always)
-     Reset Layout          (only when non-default layout stored)
+   Vivaldi already owns Speed Dial deletion — clicking its own
+   remove control is the one reliable way to trigger it, and there
+   is no supported public API for it, so this stays a thin
+   shortcut rather than a reimplementation. Icon assignment is no
+   longer a manual action, so this menu no longer offers it.
    ============================================================ */
 
 const ContextMenu = (() => {
@@ -1531,96 +873,23 @@ const ContextMenu = (() => {
         e.stopImmediatePropagation();
 
         _activeTile = tile;
-        _render(tile);
+        _render();
         _position(e.clientX, e.clientY);
     }
 
-    /* ── SVG micro-icons ────────────────────────────────────── */
+    const _REMOVE_SVG = `<svg class="swift-menu-icon-svg" viewBox="0 0 16 16" fill="none">
+        <path d="M3 4h10M6 4V3a.5.5 0 0 1 .5-.5h3A.5.5 0 0 1 10 3v1
+                 M5 4v8.5a.5.5 0 0 0 .5.5h5a.5.5 0 0 0 .5-.5V4"
+              stroke="currentColor" stroke-width="1.25"
+              stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>`;
 
-    const _SVG = {
-        changeIcon: `<svg class="swift-menu-icon-svg" viewBox="0 0 16 16" fill="none">
-            <rect x="1" y="3" width="14" height="10" rx="1.5"
-                  stroke="currentColor" stroke-width="1.25"/>
-            <circle cx="5.5" cy="7" r="1.5" fill="currentColor"/>
-            <path d="M1 10.5l3.5-3 3 2.5 2.5-2.5L15 10.5"
-                  stroke="currentColor" stroke-width="1.25" stroke-linejoin="round"/>
-        </svg>`,
-
-        resetIcon: `<svg class="swift-menu-icon-svg" viewBox="0 0 16 16" fill="none">
-            <path d="M3 8a5 5 0 1 0 1.5-3.5"
-                  stroke="currentColor" stroke-width="1.25" stroke-linecap="round"/>
-            <path d="M1 5l2.5 2.5L6 5"
-                  stroke="currentColor" stroke-width="1.25"
-                  stroke-linecap="round" stroke-linejoin="round"/>
-        </svg>`,
-
-        remove: `<svg class="swift-menu-icon-svg" viewBox="0 0 16 16" fill="none">
-            <path d="M3 4h10M6 4V3a.5.5 0 0 1 .5-.5h3A.5.5 0 0 1 10 3v1
-                     M5 4v8.5a.5.5 0 0 0 .5.5h5a.5.5 0 0 0 .5-.5V4"
-                  stroke="currentColor" stroke-width="1.25"
-                  stroke-linecap="round" stroke-linejoin="round"/>
-        </svg>`,
-
-        layout: `<svg class="swift-menu-icon-svg" viewBox="0 0 16 16" fill="none">
-            <rect x="1.5" y="1.5" width="13" height="13" rx="2"
-                  stroke="currentColor" stroke-width="1.25"/>
-            <path d="M8 4v8M4 8h8"
-                  stroke="currentColor" stroke-width="1.25" stroke-linecap="round"/>
-        </svg>`,
-
-        resetLayout: `<svg class="swift-menu-icon-svg" viewBox="0 0 16 16" fill="none">
-            <path d="M3 8a5 5 0 1 0 1-3" stroke="currentColor"
-                  stroke-width="1.25" stroke-linecap="round"/>
-            <path d="M1.5 4.5l2 2 2-2" stroke="currentColor"
-                  stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round"/>
-            <path d="M8 5v3l2 1" stroke="currentColor"
-                  stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round"/>
-        </svg>`,
-    };
-
-    /* ── Render menu for the right-clicked tile ─────────────── */
-
-    function _render(tile) {
-        const id            = getTileId(tile);
-        const hasCustomIcon = id ? StorageManager.hasIcon(id)         : false;
-        const hasCustomLay  = id ? StorageManager.hasCustomLayout(id) : false;
-        const isFolder      = tile.classList.contains("folder");
-        const changeLabel   = isFolder ? "Change Folder Icon" : "Change Icon";
-
-        let html = `
-            <div class="swift-menu-item" data-action="change-icon">
-                ${_SVG.changeIcon}<span>${changeLabel}</span>
-            </div>`;
-
-        if (hasCustomIcon) {
-            html += `
-            <div class="swift-menu-separator"></div>
-            <div class="swift-menu-item swift-menu-item--danger" data-action="reset-icon">
-                ${_SVG.resetIcon}<span>Reset Icon</span>
-            </div>`;
-        }
-
-        html += `
-            <div class="swift-menu-separator"></div>
+    function _render() {
+        _el.innerHTML = `
             <div class="swift-menu-item swift-menu-item--danger" data-action="remove-sd">
-                ${_SVG.remove}<span>Remove Speed Dial</span>
-            </div>
-            <div class="swift-menu-separator"></div>
-            <div class="swift-menu-item" data-action="customize-layout">
-                ${_SVG.layout}<span>Customize Layout</span>
+                ${_REMOVE_SVG}<span>Remove Speed Dial</span>
             </div>`;
-
-        if (hasCustomLay) {
-            html += `
-            <div class="swift-menu-item swift-menu-item--danger" data-action="reset-layout">
-                ${_SVG.resetLayout}<span>Reset Layout</span>
-            </div>`;
-        }
-
-        _el.innerHTML = html;
     }
-
-    /* ── Viewport-safe positioning ──────────────────────────── */
 
     function _position(x, y) {
         _el.style.visibility = "hidden";
@@ -1637,51 +906,16 @@ const ContextMenu = (() => {
         });
     }
 
-    /* ── Item dispatch ──────────────────────────────────────── */
-
     function _onItemClick(e) {
         const item = e.target.closest("[data-action]");
         if (!item) return;
 
-        const action = item.dataset.action;
-        const tile   = _activeTile;
-
+        const tile = _activeTile;
         _dismiss();
         if (!tile) return;
 
-        switch (action) {
-            case "change-icon": {
-                IconModal.open(tile);
-                break;
-            }
-            case "reset-icon": {
-                const id = getTileId(tile);
-                if (id) { StorageManager.removeIcon(id); reinjectTile(tile); }
-                break;
-            }
-            case "remove-sd": {
-                _removeSpeedDial(tile);
-                break;
-            }
-            case "customize-layout": {
-                // Defer slightly so the dismiss animation completes
-                requestAnimationFrame(() => EditingEngine.enter(tile));
-                break;
-            }
-            case "reset-layout": {
-                const id = getTileId(tile);
-                if (id) { StorageManager.resetLayout(id); reinjectTile(tile); }
-                break;
-            }
-        }
+        if (item.dataset.action === "remove-sd") _removeSpeedDial(tile);
     }
-
-    /* ── Speed Dial removal ─────────────────────────────────── */
-    /* Vivaldi already owns Speed Dial deletion — clicking its own remove
-       control is the one reliable way to trigger it. There is no
-       supported public API for this, so no private-API guessing and no
-       synthetic keyboard events standing in for a click that may not
-       actually be wired to anything. */
 
     function _removeSpeedDial(tile) {
         const removeBtn = tile.querySelector(
@@ -1710,16 +944,13 @@ const ContextMenu = (() => {
 /* ============================================================
    OBSERVER + BOOTSTRAP  (self-contained IIFE)
    ============================================================
-   Wrapping these in an IIFE keeps _observerTimeout, observer,
-   and _bootstrap out of the outer scope, preventing accidental
-   re-entry or external interference.
-
-   The observer uses targeted mutation handling:
-     • Newly added .SpeedDial nodes → injected immediately.
+   Scoped, targeted mutation handling:
+     • Newly added .SpeedDial nodes → processed immediately.
      • Subtree additions that might contain tiles → debounced
-       full scanTiles() for correctness.
-     • Removals and attribute mutations → ignored (tiles carry
-       their own cleanup; no observer-driven teardown needed).
+       full processAll() for correctness.
+     • Removals and attribute mutations → ignored (nothing here
+       needs observer-driven teardown; AutoIconController already
+       re-checks tile identity when its async work resolves).
    ============================================================ */
 
 (() => {
@@ -1733,17 +964,15 @@ const ContextMenu = (() => {
             for (const node of m.addedNodes) {
                 if (node.nodeType !== Node.ELEMENT_NODE) continue;
 
-                // Direct SpeedDial addition — inject immediately, no debounce.
                 if (node.classList?.contains("SpeedDial")) {
-                    injectTile(node);
+                    AutoIconController.process(node);
                     continue;
                 }
 
-                // Container that may hold SpeedDials — debounced scan.
                 if (node.querySelector?.(".SpeedDial")) {
                     clearTimeout(_debounceTimer);
-                    _debounceTimer = setTimeout(scanTiles, OBSERVER_DEBOUNCE_MS);
-                    return;   // one pending scan is enough
+                    _debounceTimer = setTimeout(AutoIconController.processAll, OBSERVER_DEBOUNCE_MS);
+                    return; // one pending scan is enough
                 }
             }
         }
@@ -1754,14 +983,13 @@ const ContextMenu = (() => {
 
     async function _bootstrap() {
         ContextMenu.init();
-        IconModal.init();
 
-        await StorageManager.init();
+        await IconService.init();
 
         if (typeof requestIdleCallback === "function") {
-            requestIdleCallback(scanTiles, { timeout: 500 });
+            requestIdleCallback(AutoIconController.processAll, { timeout: 500 });
         } else {
-            scanTiles();
+            AutoIconController.processAll();
         }
 
         console.log("[Vivaldi Swift] Ready.");
