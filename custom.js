@@ -13,36 +13,130 @@
 
    INJECTION HIERARCHY
    ===================
-     .SpeedDial
+     .SpeedDial (regular)
        .thumbnail-favicon          ← Vivaldi's safe injection point
          .custom-layout-wrapper    ← centering only, no card mutations
            .custom-icon-wrapper    ← fixed size, flex child
              <svg>
 
+     .SpeedDial.folder
+       .thumbnail-favicon-folder             ← Vivaldi's safe injection point
+         .thumbnail-favicon-children         ← Vivaldi's native 4-up preview (fallback)
+         .vivaldi-swift-folder-preview        ← our 2x2 grid, shown only once complete
+           .vivaldi-swift-folder-slot × 4
+
    AUTOMATIC ICONS
    ================
    Speed Dial icons are resolved automatically from the tile's
    target website — no manual upload, positioning, or scaling.
-   See the module map below. Vivaldi's native favicon is always
-   the fallback and is only ever hidden after a validated,
-   sanitized replacement SVG is ready to render.
+   Regular tiles and folders each get their own processing path
+   (SpeedDialIconController dispatches between them) but share
+   every lower-level piece — one cache, one provider, one
+   sanitizer. Vivaldi's native favicon/preview is always the
+   fallback and is only ever hidden after a validated, sanitized
+   replacement is ready to render.
 
-     SpeedDialUrlResolver  → recovers the tile's target URL
-     DomainNormalizer      → URL → apex domain
-     BrandResolver         → domain → theSVG slug candidate(s)
-     IconService           → cache (memory + chrome.storage.local),
-                              negative caching, in-flight dedup
-     TheSvgProvider        → fetches + validates SVGs from
-                              https://thesvg.org (jsDelivr mirror
-                              as a fallback host)
-     IconSanitizer         → same sanitizer the old manual-upload
-                              feature used; unchanged and reused
-     Renderer              → builds/injects the wrapper hierarchy
+     SpeedDialIconController → dispatches a tile to one of:
+     AutoIconController      → regular tile: URL → domain → icon
+     FolderPreviewController → folder tile: children → icons → grid
+     BookmarksApi             → chrome.bookmarks — the PRIMARY source
+                                of a tile's/child's destination URL
+                                (confirmed via Vivaldi's own React
+                                source: data-id IS the bookmark id);
+                                DOM/favicon scraping below is the
+                                fallback if this API is ever unavailable
+     SpeedDialUrlResolver    → recovers a regular tile's target URL
+     FolderChildResolver     → recovers up to 4 child URLs from a folder
+     FaviconUrl              → shared low-level favicon-srcset parsing
+     DomainNormalizer        → URL → apex domain
+     BrandResolver           → domain → theSVG slug candidate(s)
+     IconService              → cache (memory + chrome.storage.local),
+                                negative caching, in-flight dedup —
+                                the single source of truth both
+                                controllers above resolve icons through
+     TheSvgProvider           → fetches + validates SVGs from
+                                https://thesvg.org (jsDelivr mirror
+                                as a fallback host)
+     IconSanitizer            → same sanitizer the old manual-upload
+                                feature used; unchanged and reused
+     Renderer                 → builds/injects both the single-icon
+                                and the folder-grid wrapper hierarchies
 
    No version numbers here — git history is the changelog.
    ============================================================ */
 
 "use strict";
+
+
+/* ============================================================
+   DEBUG
+   ============================================================
+   Two independent layers, because getting *any* diagnostic signal
+   out of Vivaldi's own UI process is the hard part here — regular
+   webpage DevTools (F12 on a tab) attaches to that tab, not to
+   window.html, so a command typed there never reaches this script
+   at all. To actually reach the right console: open
+   vivaldi://inspect/#apps/ and click "inspect" under the entry for
+   Vivaldi's window.html (opens in a new window) — or open any
+   vivaldi:// internal page (e.g. vivaldi://startpage) and use
+   DevTools from there instead of from a regular tab.
+
+   1. window.__vivaldiSwift — always populated, no flag needed.
+      Open the correct console (see above) and type
+      `__vivaldiSwift` to see live counts and, for folders, the
+      last known state per tile. If this is undefined even in the
+      correct console, the script itself never ran (check the
+      Console tab for a load-time error, and confirm custom.js was
+      actually reinstalled and Vivaldi fully restarted — not just
+      the page reloaded — after the last update).
+
+   2. Verbose per-card/per-mutation logging — opt-in, since it's
+      too noisy to leave on by default. Enable with
+      `localStorage.setItem("vivaldi-swift-debug", "1")` typed into
+      that *same correct console*, then reload the page (Ctrl+R
+      inside that window is fine for this part — only a full
+      restart is needed after reinstalling the files themselves).
+   ============================================================ */
+
+const DEBUG = (() => {
+    try { return localStorage.getItem("vivaldi-swift-debug") === "1"; }
+    catch { return false; }
+})();
+
+function debugLog(...args) {
+    if (DEBUG) console.log("[Vivaldi Swift]", ...args);
+}
+
+const __diag = {
+    ready:        false,
+    loadedAt:     new Date().toISOString(),
+    bookmarksApiAvailable: null, // set once at bootstrap — null means "not checked yet"
+    regularCards: { total: 0, success: 0, notFound: 0, error: 0 },
+    folders:      new Map(), // tileId -> { signature, generation, childCount, resolvedCount, lastUpdated }
+    cacheEntries: 0,
+};
+try { window.__vivaldiSwift = __diag; } catch { /* non-fatal if window is somehow unavailable */ }
+
+
+/* ============================================================
+   SELECTORS
+   ============================================================
+   Every Vivaldi-DOM-specific selector string used anywhere in
+   this file lives here — nothing else hardcodes one. If a future
+   Vivaldi build renames one of these, this is the only place that
+   needs updating.
+   ============================================================ */
+
+const SELECTORS = {
+    speedDial:            ".SpeedDial",
+    regularIconClass:     "SpeedDial--Icon",
+    folderClass:          "folder",
+    regularFaviconContainer: ".thumbnail-favicon",
+    folderPreviewContainer:  ".thumbnail-favicon-folder",
+    regularFavicon:       ":scope > .thumbnail-favicon > img.favicon, :scope .thumbnail-favicon img.favicon",
+    folderChildren:       ":scope .thumbnail-favicon-children",
+    faviconImg:           "img.favicon",
+};
 
 console.log("[Vivaldi Swift] loading…");
 
@@ -251,12 +345,43 @@ const IconSanitizer = (() => {
    ============================================================ */
 
 /**
- * Return the icon host container for a tile.
+ * Regular (non-folder) tile's icon host container.
  * @param   {Element} tile
  * @returns {Element|null}
  */
-function getContainer(tile) {
-    return tile.querySelector(".thumbnail-favicon, .thumbnail-favicon-folder");
+function getRegularIconContainer(tile) {
+    return tile.querySelector(SELECTORS.regularFaviconContainer);
+}
+
+/**
+ * Folder tile's preview host container — the element our
+ * .vivaldi-swift-folder-preview grid is injected into, sibling to
+ * Vivaldi's native .thumbnail-favicon-children.
+ * @param   {Element} tile
+ * @returns {Element|null}
+ */
+function getFolderPreviewContainer(tile) {
+    return tile.querySelector(SELECTORS.folderPreviewContainer);
+}
+
+/**
+ * Folder tile's native multi-favicon preview container.
+ * @param   {Element} tile
+ * @returns {Element|null}
+ */
+function getFolderChildrenContainer(tile) {
+    return tile.querySelector(SELECTORS.folderChildren);
+}
+
+/**
+ * The (up to 4) native <img class="favicon"> nodes inside a folder's
+ * children container, in DOM order.
+ * @param   {Element} tile
+ * @returns {Element[]}
+ */
+function getFolderPreviewFaviconNodes(tile) {
+    const container = getFolderChildrenContainer(tile);
+    return container ? Array.from(container.querySelectorAll(SELECTORS.faviconImg)) : [];
 }
 
 /**
@@ -280,86 +405,144 @@ function _idPrefix(tileId) {
     return `sd4-${slug}-`;
 }
 
+/* Centralized Speed Dial type detection — the rest of the file asks
+   these two functions, never `tile.classList.contains(...)` directly,
+   so a future Vivaldi DOM change only needs an update here. */
 function isRegularSpeedDial(tile) {
-    // Folders get their own preview thumbnail (a grid of their children's
-    // favicons). We never touch that — see SpeedDialUrlResolver notes on
-    // folders below.
-    return tile.classList.contains("SpeedDial--Icon")
-        && !tile.classList.contains("folder");
+    return tile.classList.contains(SELECTORS.regularIconClass)
+        && !tile.classList.contains(SELECTORS.folderClass);
+}
+function isFolderSpeedDial(tile) {
+    return tile.classList.contains(SELECTORS.folderClass);
 }
 
 
 /* ============================================================
-   SpeedDialUrlResolver
+   FaviconUrl
    ============================================================
-   Vivaldi's Speed Dial cards do not reliably expose an <a href>.
-   The one thing every regular (non-folder) tile does expose is
-   its native favicon, whose src/srcset encodes the target page:
+   Low-level, reusable extraction of a page URL from one of
+   Vivaldi's native <img class="favicon"> elements:
 
        chrome://favicon2/?size=32&pageUrl=https://github.com/
 
-   Strategy, in order:
-     1. Explicit data-url / data-uri / data-href / href, in case a
-        future Vivaldi build (or another mod) provides one directly.
-     2. pageUrl extracted from the native favicon's srcset.
-     3. Give up — the tile keeps its native favicon, untouched.
-
-   Folders are skipped entirely: they have no single target URL,
-   and their favicon container renders a grid of child favicons,
-   not one site's icon — there is nothing here for the automatic
-   pipeline to correctly attach to.
+   Used by SpeedDialUrlResolver (one favicon per regular tile) and
+   by FolderChildResolver (up to four favicons per folder tile) —
+   written once here so neither reimplements srcset/URL parsing.
    ============================================================ */
 
-const SpeedDialUrlResolver = (() => {
+const FaviconUrl = (() => {
 
-    function resolve(tile) {
-        if (!isRegularSpeedDial(tile)) return null;
-        return _fromAttributes(tile) || _fromFavicon(tile) || null;
+    /**
+     * Ordered candidate URLs to try for one <img class="favicon">
+     * element: the browser's own resolved choice first (currentSrc,
+     * already accounts for srcset descriptors/DPR — but can be empty
+     * before layout has run), then the plain src attribute, then every
+     * srcset candidate in listed order. Vivaldi is expected to set
+     * these synchronously at element-creation time in every case we've
+     * observed, but nothing here assumes that — if a candidate isn't
+     * populated yet, it's simply absent from this list and we fall
+     * through to the next.
+     * @param {Element|null} img
+     * @returns {string[]}
+     */
+    function _candidateUrls(img) {
+        if (!img) return [];
+        const out = [];
+        if (img.currentSrc) out.push(img.currentSrc);
+        if (img.src) out.push(img.src);
+
+        const srcset = img.getAttribute("srcset") || img.srcset;
+        if (srcset) {
+            for (const candidate of srcset.split(",")) {
+                const url = candidate.trim().split(/\s+/)[0];
+                if (url) out.push(url);
+            }
+        }
+        return out;
     }
 
-    function _fromAttributes(tile) {
-        const raw =
-            tile.dataset.url ||
-            tile.dataset.uri ||
-            tile.dataset.href ||
-            tile.getAttribute("href");
-        return _clean(raw);
-    }
+    /** @param {Element|null} img — an <img class="favicon"> element */
+    function extractFromImg(img) {
+        for (const candidate of _candidateUrls(img)) {
+            const unwrapped = cleanHttpUrl(_extractDestinationParam(candidate));
+            if (unwrapped) return unwrapped;
 
-    function _fromFavicon(tile) {
-        const img = tile.querySelector(
-            ":scope > .thumbnail-favicon > img.favicon, :scope .thumbnail-favicon img.favicon"
-        );
-        const srcset = img?.getAttribute("srcset") || img?.srcset;
-        if (!srcset) return null;
-
-        // srcset is a comma-separated candidate list, each
-        // "<url> <descriptor>" (e.g. "chrome://favicon2/?...=64 64w").
-        // Every candidate points at the same page — the first is enough.
-        for (const candidate of srcset.split(",")) {
-            const url = candidate.trim().split(/\s+/)[0];
-            if (!url) continue;
-
-            const pageUrl = _extractPageUrl(url);
-            const cleaned = _clean(pageUrl);
-            if (cleaned) return cleaned;
+            // Vivaldi's own Favicon component (confirmed from its real source:
+            // the render() branch keyed on loadType "faviconSkipCache"/"data")
+            // sometimes sets `src` directly to an already-meaningful URL with
+            // no chrome://favicon2 wrapper at all — no srcset, no query params.
+            // If a candidate is already a plain http(s) URL on its own, use it
+            // as-is rather than only ever looking for a wrapped param.
+            const direct = cleanHttpUrl(candidate);
+            if (direct) return direct;
         }
         return null;
     }
 
-    function _extractPageUrl(faviconUrl) {
+    /**
+     * Same extraction as extractFromImg, but returns every intermediate
+     * value instead of just the final answer — used only by debug
+     * logging (FolderChildResolver), never on the hot path.
+     * @param {Element|null} img
+     */
+    function extractDetailed(img) {
+        const candidateUrls = _candidateUrls(img);
+        const attempts = candidateUrls.map(candidate => {
+            const param = _extractDestinationParam(candidate);
+            const unwrapped = cleanHttpUrl(param);
+            const direct = unwrapped ? null : cleanHttpUrl(candidate);
+            return { candidate, param, cleaned: unwrapped || direct };
+        });
+        return {
+            currentSrc: img?.currentSrc || null,
+            src:        img?.src || null,
+            srcset:     img?.getAttribute("srcset") || img?.srcset || null,
+            attempts,
+            result:     attempts.find(a => a.cleaned)?.cleaned || null,
+        };
+    }
+
+    /**
+     * Vivaldi's real Favicon component (confirmed from its actual source,
+     * module 97009 in bundle.js) builds the srcset as either:
+     *
+     *   chrome://favicon2/?size=N&pageUrl=<destination>   (loadType "page")
+     *   chrome://favicon2/?size=N&iconUrl=<favicon-asset>  (loadType
+     *                                                       "faviconFromCache",
+     *                                                       used whenever the
+     *                                                       bookmark already
+     *                                                       has a cached
+     *                                                       faviconUrl — this
+     *                                                       is the common case
+     *                                                       for folder preview
+     *                                                       children, which is
+     *                                                       exactly why folders
+     *                                                       kept failing while
+     *                                                       regular tiles —
+     *                                                       which hit "page"
+     *                                                       far more often —
+     *                                                       mostly didn't)
+     *
+     * iconUrl isn't guaranteed to be the destination page itself — it can be
+     * the favicon *asset's* own URL — but that's overwhelmingly same-origin
+     * in practice, so it's a far better outcome than never extracting
+     * anything at all. pageUrl is tried first whenever both could apply.
+     */
+    function _extractDestinationParam(faviconUrl) {
         try {
-            return new URL(faviconUrl, location.href).searchParams.get("pageUrl");
+            const params = new URL(faviconUrl, location.href).searchParams;
+            return params.get("pageUrl") || params.get("iconUrl");
         } catch {
             // Defensive fallback only — chrome://favicon2 URLs parse fine
             // with the URL constructor in practice, but never let a parser
             // edge case break icon resolution for every other tile too.
-            const m = /[?&]pageUrl=([^&]+)/.exec(faviconUrl);
+            const m = /[?&](?:pageUrl|iconUrl)=([^&]+)/.exec(faviconUrl);
             return m ? decodeURIComponent(m[1]) : null;
         }
     }
 
-    function _clean(raw) {
+    /** @param {string|null} raw */
+    function cleanHttpUrl(raw) {
         if (!raw) return null;
         try {
             const u = new URL(raw);
@@ -368,6 +551,163 @@ const SpeedDialUrlResolver = (() => {
         } catch {
             return null;
         }
+    }
+
+    return { extractFromImg, extractDetailed, cleanHttpUrl };
+
+})();
+
+
+/* ============================================================
+   SpeedDialUrlResolver
+   ============================================================
+   Vivaldi's Speed Dial cards do not reliably expose an <a href>.
+   The one thing every regular (non-folder) tile does expose is
+   its native favicon — see FaviconUrl above for how that's read.
+
+   Strategy, in order:
+     1. Explicit data-url / data-uri / data-href / href, in case a
+        future Vivaldi build (or another mod) provides one directly.
+     2. pageUrl extracted from the native favicon's srcset.
+     3. Give up — the tile keeps its native favicon, untouched.
+
+   Folders are out of scope for this resolver: they have no single
+   target URL. See FolderChildResolver for how folders are handled.
+   ============================================================ */
+
+/* ============================================================
+   BookmarksApi
+   ============================================================
+   Every Speed Dial tile IS a bookmark node in Vivaldi's model —
+   confirmed directly from Vivaldi's own React source (bundle.js):
+   the tile's `data-id` is literally the bookmark node's `id`
+   (`"data-id": e.id` in the render() that builds the outer
+   .SpeedDial div), and that same bundle calls
+   `chrome.bookmarks.getTree()` itself, from this same UI context,
+   to walk the bookmark tree.
+
+   That makes the standard chrome.bookmarks API a far more direct
+   source of truth than reverse-engineering a destination URL out
+   of a rendered favicon element's src/srcset — it hands back the
+   bookmark's actual `.url` (or, for a folder, its `.children`
+   array of `{id, url, ...}`) with no parsing or guessing at all.
+
+   Used as the *first* strategy everywhere it applies; DOM/favicon
+   scraping (SpeedDialUrlResolver / FolderChildResolver's existing
+   logic) remains as the fallback if this API is ever unavailable
+   or errors, so nothing regresses if some Vivaldi build restricts
+   it from this context.
+   ============================================================ */
+
+const BookmarksApi = (() => {
+
+    function available() {
+        try { return typeof chrome !== "undefined" && !!chrome.bookmarks?.getChildren && !!chrome.bookmarks?.get; }
+        catch { return false; }
+    }
+
+    /** @param {string} id @returns {Promise<object|null>} the bookmark node, or null on any failure */
+    function get(id) {
+        return new Promise(resolve => {
+            try {
+                chrome.bookmarks.get(id, nodes => {
+                    if (chrome.runtime.lastError) { resolve(null); return; }
+                    resolve(nodes?.[0] || null);
+                });
+            } catch {
+                resolve(null);
+            }
+        });
+    }
+
+    /** @param {string} id @returns {Promise<object[]|null>} child bookmark nodes in order, or null on any failure */
+    function getChildren(id) {
+        return new Promise(resolve => {
+            try {
+                chrome.bookmarks.getChildren(id, nodes => {
+                    if (chrome.runtime.lastError) { resolve(null); return; }
+                    resolve(nodes || null);
+                });
+            } catch {
+                resolve(null);
+            }
+        });
+    }
+
+    /**
+     * Removes a bookmark node and, if it's a folder, everything inside it —
+     * a Speed Dial tile IS a bookmark node either way (see the module
+     * header), so removeTree is correct for both a regular tile and a
+     * folder tile without needing to branch on which one it is.
+     * @param {string} id @returns {Promise<boolean>} true on confirmed success
+     */
+    function removeTree(id) {
+        return new Promise(resolve => {
+            try {
+                chrome.bookmarks.removeTree(id, () => resolve(!chrome.runtime.lastError));
+            } catch {
+                resolve(false);
+            }
+        });
+    }
+
+    return { available, get, getChildren, removeTree };
+
+})();
+
+
+/* ============================================================
+   SpeedDialUrlResolver
+   ============================================================
+   Vivaldi's Speed Dial cards do not reliably expose an <a href>.
+   Preferred strategy, in order:
+     1. Explicit data-url / data-uri / data-href / href, in case a
+        future Vivaldi build (or another mod) provides one directly.
+     2. chrome.bookmarks.get(tileId).url — the bookmark's own
+        recorded URL, no parsing required (see BookmarksApi above).
+     3. pageUrl/iconUrl extracted from the native favicon's srcset
+        (see FaviconUrl) — the fallback if the bookmarks API isn't
+        available for any reason.
+
+   Folders are out of scope for this resolver: they have no single
+   target URL. See FolderChildResolver for how folders are handled.
+   ============================================================ */
+
+const SpeedDialUrlResolver = (() => {
+
+    async function resolve(tile) {
+        if (!isRegularSpeedDial(tile)) return null;
+
+        const attr = _fromAttributes(tile);
+        if (attr) return attr;
+
+        const viaBookmarks = await _fromBookmarksApi(tile);
+        if (viaBookmarks) return viaBookmarks;
+
+        return _fromFavicon(tile);
+    }
+
+    function _fromAttributes(tile) {
+        const raw =
+            tile.dataset.url ||
+            tile.dataset.uri ||
+            tile.dataset.href ||
+            tile.getAttribute("href");
+        return FaviconUrl.cleanHttpUrl(raw);
+    }
+
+    async function _fromBookmarksApi(tile) {
+        if (!BookmarksApi.available()) return null;
+        const tileId = getTileId(tile);
+        if (!tileId) return null;
+
+        const node = await BookmarksApi.get(tileId);
+        return node?.url ? FaviconUrl.cleanHttpUrl(node.url) : null;
+    }
+
+    function _fromFavicon(tile) {
+        const img = tile.querySelector(SELECTORS.regularFavicon);
+        return FaviconUrl.extractFromImg(img);
     }
 
     return { resolve };
@@ -389,6 +729,18 @@ const SpeedDialUrlResolver = (() => {
    guess, which just means a brand lookup for a rare ccTLD may
    occasionally use a slightly-too-broad domain — worst case is a
    negative cache entry, not a wrong icon on someone else's tile.
+
+   One deliberate exception to "always collapse to apex": a small
+   set of domains host multiple distinct, separately-branded
+   products under one apex (gemini.google.com and mail.google.com
+   are visually nothing alike, and collapsing both to "google.com"
+   would show every Google product the same generic icon). For
+   those specific apexes only, the immediate subdomain is kept as
+   part of the identity instead of being stripped — see
+   MULTI_PRODUCT_APEX below. Everything else (the vast majority of
+   domains) still collapses normally, which keeps the cache
+   effective: five Speed Dials to different docs.google.com URLs
+   still share one lookup and one cache entry.
    ============================================================ */
 
 const DomainNormalizer = (() => {
@@ -398,6 +750,9 @@ const DomainNormalizer = (() => {
         "co.jp", "co.in", "co.nz", "co.za", "co.kr",
         "com.au", "com.br", "com.mx", "com.tr", "com.sg", "com.hk",
     ]);
+
+    /** Apex domains whose first-level subdomain is its own distinct brand. */
+    const MULTI_PRODUCT_APEX = new Set(["google.com"]);
 
     function normalize(rawUrl) {
         let host;
@@ -409,7 +764,10 @@ const DomainNormalizer = (() => {
         if (!host) return null;
 
         host = host.replace(/^www\./, "");
-        return _apex(host);
+        const apex = _apex(host);
+
+        if (MULTI_PRODUCT_APEX.has(apex) && host !== apex) return host;
+        return apex;
     }
 
     function _apex(host) {
@@ -429,6 +787,95 @@ const DomainNormalizer = (() => {
 
 
 /* ============================================================
+   FolderChildResolver
+   ============================================================
+   Folders have no single target URL — they represent a set of
+   Speed Dials. Evidence for their DOM shape comes from two
+   places: the project's own CSS, which has always targeted
+   `img.favicon` elements *inside* `.thumbnail-favicon-children`
+   (i.e. Vivaldi renders the same native favicon element for a
+   folder's child previews that it renders for a regular tile —
+   FaviconUrl's srcset-parsing logic therefore applies unchanged),
+   and the confirmed regular-tile favicon URL format reused as-is.
+
+   What is NOT independently verified — the DOM reconnaissance
+   capture this project was built from contained zero folders — is
+   whether native DOM order always matches the visual 2x2 grid
+   order, and whether exactly ≤4 favicon elements are ever present
+   at once. The renderer (see FolderPreviewRenderer) is built so
+   getting that assumption wrong degrades to "icons in a slightly
+   different order," never to a blank or broken folder — see its
+   header comment for how.
+   ============================================================ */
+
+const FolderChildResolver = (() => {
+
+    const MAX_CHILDREN = 4;
+
+    /**
+     * @param   {Element} folderTile
+     * @returns {Promise<Array<{index:number, url:string|null, domain:string|null, faviconUrl:string|null}>>}
+     */
+    async function resolve(folderTile) {
+        if (!isFolderSpeedDial(folderTile)) return [];
+
+        const favicons = getFolderPreviewFaviconNodes(folderTile).slice(0, MAX_CHILDREN);
+        if (!favicons.length) return [];
+
+        const bookmarkChildren = await _bookmarkChildren(folderTile);
+
+        return favicons.map((img, index) => {
+            // Preferred: the bookmark's own recorded URL for this exact
+            // child, by position — see BookmarksApi. Falls back to
+            // scraping the rendered favicon's src/srcset only if the API
+            // wasn't available or didn't return enough children.
+            const bookmarkUrl = bookmarkChildren?.[index]?.url
+                ? FaviconUrl.cleanHttpUrl(bookmarkChildren[index].url)
+                : null;
+            const url    = bookmarkUrl || FaviconUrl.extractFromImg(img);
+            const domain = url ? DomainNormalizer.normalize(url) : null;
+            const source = bookmarkUrl ? "bookmarks" : (url ? "favicon" : null);
+
+            // img.currentSrc/img.src is the browser's own resolved favicon
+            // image source — kept as a per-slot visual fallback even when
+            // URL resolution fails entirely (the image can still be
+            // perfectly renderable; we just can't determine what site it
+            // represents, so it never drives an SVG lookup). A slot only
+            // ever ends up with neither url nor faviconUrl if the <img>
+            // itself has no usable src/srcset at all.
+            const faviconUrl = img.currentSrc || img.src || null;
+
+            // Two Speed Dials inside the same folder can legitimately point
+            // at the same domain (e.g. two different github.com repos) —
+            // that's a real, valid state, not something to silently merge
+            // or drop. Both slots resolve to the same icon, which is
+            // correct. IconService's in-flight/positive cache already
+            // ensures that costs one lookup, not two.
+            return { index, url: url || null, domain, faviconUrl, source };
+        });
+    }
+
+    /**
+     * @param {Element} folderTile
+     * @returns {Promise<object[]|null>} first MAX_CHILDREN bookmark child
+     *          nodes in order, or null if the API is unavailable/failed —
+     *          callers must fall back to DOM scraping per-slot in that case.
+     */
+    async function _bookmarkChildren(folderTile) {
+        if (!BookmarksApi.available()) return null;
+        const folderId = getTileId(folderTile);
+        if (!folderId) return null;
+
+        const children = await BookmarksApi.getChildren(folderId);
+        return children ? children.slice(0, MAX_CHILDREN) : null;
+    }
+
+    return { resolve };
+
+})();
+
+
+/* ============================================================
    BrandResolver
    ============================================================
    Domain → ordered list of theSVG slug candidates.
@@ -443,6 +890,11 @@ const BrandResolver = (() => {
 
     const ALIASES = new Map([
         ["x.com", "twitter"],
+        ["mail.google.com", "gmail"], // the only Google product whose subdomain label ("mail")
+                                       // doesn't match its actual brand name — see
+                                       // DomainNormalizer's MULTI_PRODUCT_APEX for why
+                                       // "mail.google.com" reaches this function intact
+                                       // instead of being collapsed to "google.com".
     ]);
 
     function candidates(domain) {
@@ -598,6 +1050,7 @@ const IconService = (() => {
                 }
             }
             console.log(`[Vivaldi Swift] Auto-icon cache hydrated — ${_mem.size} domain(s).`);
+            __diag.cacheEntries = _mem.size;
         } catch (e) {
             console.error("[Vivaldi Swift] Auto-icon cache init failed:", e);
         }
@@ -746,7 +1199,113 @@ const Renderer = (() => {
         return wrap;
     }
 
-    return { renderLayoutWrapper, renderSVG };
+    /**
+     * Per-count grid container styles. Four icons is the only case
+     * that's genuinely a 2x2 grid; 1-3 icons get a layout sized for
+     * that count specifically (see this function's header) rather
+     * than a 4-cell grid with empty cells stretched to fill it.
+     *
+     * Deliberately NOT position:absolute/inset:0 — .thumbnail-favicon-folder
+     * (the parent we're appended into) already centers its children via
+     * flex/grid place-content, both natively and via this project's own
+     * "ICON POSITIONING" CSS rule, exactly the way .custom-layout-wrapper
+     * centers the single-icon case for regular tiles. Filling the whole
+     * (non-square, ~90x64) container and dividing it with 1fr/percentage
+     * stretching was the actual cause of the uneven spacing — icon size
+     * came out different in each direction because the container isn't
+     * square. Fixed pixel sizes (via CSS custom properties, see
+     * vivaldi_swift.css) sidestep that entirely: every slot is a true
+     * square regardless of the parent's aspect ratio, the same way
+     * --custom-icon-size works for regular tiles.
+     */
+    const LAYOUT_BY_COUNT = {
+        1: { display: "flex", alignItems: "center", justifyContent: "center" },
+        2: { display: "flex", flexDirection: "row", alignItems: "center", justifyContent: "center" },
+        3: { display: "grid", gridTemplateColumns: "repeat(2, var(--custom-folder-slot-size))", gridTemplateRows: "repeat(2, var(--custom-folder-slot-size))" },
+        4: { display: "grid", gridTemplateColumns: "repeat(2, var(--custom-folder-slot-size))", gridTemplateRows: "repeat(2, var(--custom-folder-slot-size))" },
+    };
+
+    /** Slot side length per count — smaller counts get a bit more visual weight per icon. */
+    const SLOT_SIZE_BY_COUNT = { 1: "34px", 2: "24px", 3: "20px", 4: "20px" };
+
+    function _makeSlot(slot, index, folderIdPrefix) {
+        const cell = document.createElement("div");
+        cell.className = "vivaldi-swift-folder-slot";
+        cell.dataset.index = String(index);
+
+        if (slot?.svg) {
+            const iconEl = renderSVG(slot.svg, `${folderIdPrefix}slot${index}-`);
+            cell.appendChild(iconEl);
+        } else if (slot?.faviconUrl) {
+            const img = document.createElement("img");
+            img.src = slot.faviconUrl;
+            img.alt = "";
+            cell.appendChild(img);
+        }
+        // Neither available → cell stays empty (transparent), never a broken-image icon.
+
+        return cell;
+    }
+
+    /**
+     * Builds a complete, self-contained folder preview — laid out for
+     * however many icons are actually available (1, 2, 3, or 4), not
+     * always a 2x2 grid with empty cells stretched to fill unused
+     * space:
+     *
+     *   1  →  single icon, centered
+     *   2  →  side by side
+     *   3  →  two on top, one centered underneath
+     *   4  →  standard 2x2 grid
+     *
+     * Every slot gets *something* rendered — an SVG if one resolved,
+     * otherwise that child's own native favicon image (re-hosted, not
+     * borrowed from the live native DOM) — so the grid is never a
+     * worse representation than Vivaldi's native preview would be,
+     * only ever an equal or better one. That's what makes it safe to
+     * swap in wholesale rather than trying to overlay partial results
+     * on top of native content of unknown layout.
+     *
+     * @param {Array<{index:number, svg?:string, faviconUrl?:string}>} slots — already
+     *        sorted by index; length is however many real children the
+     *        folder has (1-4), not necessarily 4
+     * @param {string} folderIdPrefix — unique per folder tile
+     */
+    function renderFolderPreview(slots, folderIdPrefix) {
+        const grid = document.createElement("div");
+        grid.className = "vivaldi-swift-folder-preview";
+        grid.setAttribute("aria-hidden", "true");
+
+        const present = slots.filter(s => s.svg || s.faviconUrl);
+        const count = Math.min(present.length, 4) || 1; // defensive floor; caller already guards count===0
+
+        Object.assign(grid.style, LAYOUT_BY_COUNT[count]);
+        grid.style.setProperty("--custom-folder-slot-size", SLOT_SIZE_BY_COUNT[count]);
+        grid.dataset.count = String(count);
+
+        if (count === 3) {
+            // [A][B] on row 1, [C] centered spanning both columns on row 2.
+            const [a, b, c] = present;
+            const cellA = _makeSlot(a, a.index, folderIdPrefix);
+            const cellB = _makeSlot(b, b.index, folderIdPrefix);
+            const cellC = _makeSlot(c, c.index, folderIdPrefix);
+            cellA.style.gridColumn = "1"; cellA.style.gridRow = "1";
+            cellB.style.gridColumn = "2"; cellB.style.gridRow = "1";
+            cellC.style.gridColumn = "1 / span 2"; cellC.style.gridRow = "2";
+            cellC.style.justifySelf = "center";
+            grid.append(cellA, cellB, cellC);
+        } else if (count === 1) {
+            grid.appendChild(_makeSlot(present[0], present[0].index, folderIdPrefix));
+        } else if (count === 2) {
+            present.forEach(s => grid.appendChild(_makeSlot(s, s.index, folderIdPrefix)));
+        } else {
+            present.slice(0, 4).forEach(s => grid.appendChild(_makeSlot(s, s.index, folderIdPrefix)));
+        }
+
+        return grid;
+    }
+
+    return { renderLayoutWrapper, renderSVG, renderFolderPreview };
 
 })();
 
@@ -771,23 +1330,31 @@ const AutoIconController = (() => {
     /** Tiles whose async resolution has already been kicked off. */
     const _started = new WeakSet();
 
-    function process(tile) {
+    async function process(tile) {
         if (!isRegularSpeedDial(tile)) return;
         if (_started.has(tile)) return;
         _started.add(tile);
 
-        const url = SpeedDialUrlResolver.resolve(tile);
+        const url = await SpeedDialUrlResolver.resolve(tile);
         if (!url) return; // no recoverable URL — native favicon stands, nothing more to do
 
         const domain = DomainNormalizer.normalize(url);
         if (!domain) return;
 
-        IconService.resolve(domain)
-            .then(result => _apply(tile, domain, result))
-            .catch(e => console.warn("[Vivaldi Swift] Auto-icon lookup failed:", e));
+        try {
+            const result = await IconService.resolve(domain);
+            debugLog("Regular card", getTileId(tile) || "(no id)", "— URL:", domain, "— icon:", result.status);
+            __diag.regularCards.total += 1;
+            if (result.status === "success")        __diag.regularCards.success  += 1;
+            else if (result.status === "not-found")  __diag.regularCards.notFound += 1;
+            else                                     __diag.regularCards.error    += 1;
+            await _apply(tile, domain, result);
+        } catch (e) {
+            console.warn("[Vivaldi Swift] Auto-icon lookup failed:", e);
+        }
     }
 
-    function _apply(tile, expectedDomain, result) {
+    async function _apply(tile, expectedDomain, result) {
         if (result.status !== "success") return; // not-found / error → native favicon stands
 
         // The async lookup may have outlived the tile (removed, or Vivaldi
@@ -795,10 +1362,10 @@ const AutoIconController = (() => {
         // fetching). Re-check both connectivity and identity before
         // touching the DOM.
         if (!tile.isConnected) return;
-        const stillSameCard = SpeedDialUrlResolver.resolve(tile);
+        const stillSameCard = await SpeedDialUrlResolver.resolve(tile);
         if (!stillSameCard || DomainNormalizer.normalize(stillSameCard) !== expectedDomain) return;
 
-        const container = getContainer(tile);
+        const container = getRegularIconContainer(tile);
         if (!container) return;
 
         // Avoid double-injection if this tile is somehow processed twice
@@ -825,8 +1392,247 @@ const AutoIconController = (() => {
         tile.dataset.vivaldiSwiftIcon = "auto"; // debugging/CSS hook only, not a state gate
     }
 
+    return { process };
+
+})();
+
+
+/* ============================================================
+   FolderPreviewController
+   ============================================================
+   Folder counterpart to AutoIconController. Discovers up to four
+   child domains (FolderChildResolver), resolves each independently
+   through the *same* IconService regular tiles use, and — only once
+   every lookup has settled — builds one complete replacement grid
+   (Renderer.renderFolderPreview) and swaps it in.
+
+   This fixes the previous blank-folder regression, which had two
+   causes stacked on each other: (1) folders were never given a
+   replacement of any kind, and (2) pre-existing CSS from the old
+   manual-icon era unconditionally hid Vivaldi's native folder
+   preview regardless. That CSS has been removed — see
+   vivaldi_swift.css — so an un-processed or unresolvable folder now
+   simply shows its normal native preview, same as before this
+   feature existed at all.
+
+   Per-slot fallback (SVG → that child's own native favicon → empty)
+   is handled inside Renderer.renderFolderPreview itself, which is
+   why this controller can safely wait for full settlement rather
+   than juggling partial DOM updates as each lookup completes —
+   see that function's header comment for the reasoning.
+
+   Content-change detection: a folder's children can change without
+   its own tile element ever being recreated (items dragged in/out,
+   reordered). Each call to process() re-discovers the current
+   children and compares a signature (built from each slot's actual
+   destination URL, not just its normalized domain, so a same-domain-
+   different-page change is still detected — see FolderChildResolver)
+   against the signature last *started*. A mismatch always supersedes
+   whatever's currently resolving, via a per-tile generation counter:
+   starting new work never waits for old work to finish first, and old
+   work simply discards its own result if the generation has moved on
+   by the time it completes. This replaces an earlier version of this
+   controller that gated new work behind `!prior.resolving`, which
+   could permanently drop a content change that arrived while a
+   previous resolution for that same folder was still in flight.
+   ============================================================ */
+
+const FolderPreviewController = (() => {
+
+    /**
+     * @typedef {{signature:string, generation:number}} FolderState
+     * @type {WeakMap<Element, FolderState>}
+     */
+    const _state = new WeakMap();
+
+    async function process(tile) {
+        if (!isFolderSpeedDial(tile)) return;
+
+        const tileKey = getTileId(tile) || `(no id, ${Math.random().toString(36).slice(2, 8)})`;
+
+        const children = await FolderChildResolver.resolve(tile);
+        const signature = children.map(c => `${c.index}:${c.url || ""}`).join("|");
+
+        let state = _state.get(tile);
+        if (!state) {
+            state = { signature: null, generation: 0 };
+            _state.set(tile, state);
+        }
+
+        // Detection itself is recorded before the "nothing changed" early
+        // return below, so a folder that's found but never gets any
+        // further still shows up in __vivaldiSwift.folders — if the map
+        // stays empty entirely, isFolderSpeedDial() is never matching
+        // anything, which is a different (and earlier) problem than
+        // anything downstream.
+        __diag.folders.set(tileKey, {
+            ...( __diag.folders.get(tileKey) || {} ),
+            childCount: children.length,
+            lastSeenAt: new Date().toISOString(),
+        });
+
+        if (state.signature === signature) return; // already started (or already applied) for this exact content
+
+        state.signature  = signature;
+        state.generation += 1;
+        const myGeneration = state.generation;
+
+        if (DEBUG) {
+            debugLog(`Folder ${getTileId(tile) || "(no id)"} — signature changed, generation ${myGeneration}`);
+            debugLog(`  preview container: ${getFolderPreviewContainer(tile) ? "found" : "MISSING"}`);
+            debugLog(`  children container: ${getFolderChildrenContainer(tile) ? "found" : "MISSING"}`);
+            debugLog(`  favicon nodes: ${getFolderPreviewFaviconNodes(tile).length}`);
+            children.forEach(c => {
+                debugLog(`  child ${c.index}: url=${c.url || "(none)"} domain=${c.domain || "(none)"} source=${c.source || "(none)"} faviconUrl=${c.faviconUrl || "(none)"}`);
+            });
+        }
+
+        if (!children.length) {
+            _clearPreview(tile);
+            debugLog(`Folder ${getTileId(tile) || "(no id)"} — no favicon nodes found, native preview stands.`);
+            return;
+        }
+
+        Promise.allSettled(
+            children.map(child =>
+                // A child with no resolvable domain (extraction failed for
+                // every candidate on that <img>) never reaches the network —
+                // it still carries a faviconUrl fallback through to
+                // rendering, just with no possibility of an SVG upgrade.
+                child.domain
+                    ? IconService.resolve(child.domain).then(result => ({ ...child, result }))
+                    : Promise.resolve({ ...child, result: { status: "not-found" } })
+            )
+        ).then(settled => {
+            // The folder's contents may have changed again while these
+            // lookups were in flight — the generation captured above
+            // will no longer match state.generation in that case, and
+            // this (now-stale) result is dropped. Note this is *not*
+            // gated behind "no newer work has started" — newer work is
+            // always allowed to start immediately (see the signature
+            // check above), so by the time we get here the newer
+            // generation may already be resolving or even applied.
+            if (state.generation !== myGeneration) {
+                debugLog(`Folder ${getTileId(tile) || "(no id)"} — generation ${myGeneration} superseded by ${state.generation}, discarding.`);
+                return;
+            }
+            const resolvedCount = settled.filter(r => r.status === "fulfilled" && r.value.result?.status === "success").length;
+            __diag.folders.set(tileKey, {
+                ...( __diag.folders.get(tileKey) || {} ),
+                resolvedCount,
+                lastResult: settled.map(r => r.status === "fulfilled"
+                    ? `${r.value.domain || "(no domain)"}:${r.value.result?.status}`
+                    : "rejected"),
+                lastUpdated: new Date().toISOString(),
+            });
+            if (DEBUG) {
+                settled.forEach(r => {
+                    if (r.status === "fulfilled") debugLog(`  ${r.value.domain} → ${r.value.result?.status}`);
+                });
+            }
+            _apply(tile, settled);
+        });
+    }
+
+    function _apply(tile, settled) {
+        if (!tile.isConnected) return;
+        const childrenContainer = getFolderChildrenContainer(tile);
+        if (!childrenContainer) return; // folder DOM changed shape under us — leave native alone
+
+        const container = getFolderPreviewContainer(tile);
+        if (!container) return;
+
+        // Preserve original discovery order regardless of which lookup
+        // settled first — Promise.allSettled already preserves input
+        // order in its output array, but this is the one invariant the
+        // whole feature depends on, so it's asserted explicitly here
+        // rather than trusted implicitly.
+        const slots = settled
+            .filter(r => r.status === "fulfilled")
+            .map(r => r.value)
+            .sort((a, b) => a.index - b.index)
+            .map(child => ({
+                index:      child.index,
+                svg:        child.result?.status === "success" ? child.result.svg : undefined,
+                faviconUrl: child.faviconUrl,
+            }));
+
+        // Nothing usable at all (every lookup errored/not-found AND, in
+        // principle, every faviconUrl was somehow also missing) → don't
+        // render an empty grid over a perfectly fine native preview.
+        const hasAnyContent = slots.some(s => s.svg || s.faviconUrl);
+        if (!hasAnyContent) { _clearPreview(tile); return; }
+
+        container.style.position = "relative";
+
+        const folderSlug = (getTileId(tile) || Math.random().toString(36).slice(2))
+            .replace(/[^a-zA-Z0-9]/g, "_");
+        const folderIdPrefix = `sd4-folder-${folderSlug}-`;
+        const grid = Renderer.renderFolderPreview(slots, folderIdPrefix);
+
+        // Build the new grid completely before touching anything already
+        // in the DOM, then swap in one step — this is what keeps a content
+        // change (Part 18) from ever producing a flash of "no preview".
+        const existing = container.querySelector(".vivaldi-swift-folder-preview");
+        if (existing) existing.replaceWith(grid); else container.appendChild(grid);
+
+        // The grid is a complete, self-contained representation (real SVG
+        // or a re-hosted native favicon per slot — see renderFolderPreview),
+        // so — exactly as with regular tiles — hiding native content can
+        // happen in the same synchronous block as a successful append.
+        childrenContainer.style.opacity = "0";
+
+        tile.dataset.vivaldiSwiftIcon = "auto-folder"; // debugging/CSS hook only
+        const tileKey = getTileId(tile);
+        if (tileKey) {
+            __diag.folders.set(tileKey, {
+                ...( __diag.folders.get(tileKey) || {} ),
+                injected: true,
+                slotsShown: slots.filter(s => s.svg || s.faviconUrl).length,
+            });
+        }
+        debugLog(`Folder ${getTileId(tile) || "(no id)"} — preview injected: true — resolved ${slots.filter(s => s.svg).length}/${slots.length} — native hidden: true`);
+    }
+
+    /** Undo our own additions, reverting to whatever Vivaldi renders natively. */
+    function _clearPreview(tile) {
+        const container = getFolderPreviewContainer(tile);
+        const existing = container?.querySelector(".vivaldi-swift-folder-preview");
+        if (existing) existing.remove();
+
+        const childrenContainer = getFolderChildrenContainer(tile);
+        if (childrenContainer) childrenContainer.style.opacity = "";
+
+        delete tile.dataset.vivaldiSwiftIcon;
+    }
+
+    return { process };
+
+})();
+
+
+/* ============================================================
+   SpeedDialIconController
+   ============================================================
+   Thin dispatcher — the only place in the file that branches on
+   Speed Dial type. Both scanning entry points (initial bootstrap
+   scan, MutationObserver callback) go through this, so there is
+   exactly one processAll() and one per-tile routing decision, not
+   a separate scan for folders and another for regular tiles.
+   ============================================================ */
+
+const SpeedDialIconController = (() => {
+
+    function process(tile) {
+        if (isFolderSpeedDial(tile)) {
+            FolderPreviewController.process(tile);
+        } else if (isRegularSpeedDial(tile)) {
+            AutoIconController.process(tile);
+        }
+    }
+
     function processAll() {
-        for (const tile of document.querySelectorAll(".SpeedDial")) {
+        for (const tile of document.querySelectorAll(SELECTORS.speedDial)) {
             process(tile);
         }
     }
@@ -866,7 +1672,7 @@ const ContextMenu = (() => {
     }
 
     function _onContextMenu(e) {
-        const tile = e.target.closest(".SpeedDial");
+        const tile = e.target.closest(SELECTORS.speedDial);
         if (!tile) { _dismiss(); return; }
 
         e.preventDefault();
@@ -917,14 +1723,38 @@ const ContextMenu = (() => {
         if (item.dataset.action === "remove-sd") _removeSpeedDial(tile);
     }
 
-    function _removeSpeedDial(tile) {
-        const removeBtn = tile.querySelector(
-            ".RemoveButton, [data-vivaldi-action='remove'], [aria-label='Remove']"
-        );
-        if (removeBtn) {
-            removeBtn.click();
+    /**
+     * A Speed Dial tile IS a bookmark node (data-id is literally the
+     * bookmark id — confirmed from Vivaldi's own React source; see
+     * BookmarksApi's header comment), so chrome.bookmarks.removeTree()
+     * is the direct, correct way to remove one regardless of whether
+     * it's a regular tile or a folder.
+     *
+     * This used to click a guessed selector (.RemoveButton /
+     * [data-vivaldi-action='remove'] / [aria-label='Remove']) that
+     * doesn't exist in Vivaldi's real DOM at all — confirmed against
+     * both the actual bundle.js and common.css, which is why this
+     * silently did nothing before. The real native button is
+     * `.close` (top-right, hover-revealed) — kept below as an
+     * automatic fallback for the one real gap removeTree has: Vivaldi
+     * has a genuine "Show Delete Speed Dial Button" setting, and
+     * nothing here can distinguish "bookmarks API unavailable" from
+     * "user turned that setting off elsewhere" — but removeTree
+     * doesn't depend on that setting or on any particular DOM
+     * structure at all, so it's tried first.
+     */
+    async function _removeSpeedDial(tile) {
+        const tileId = getTileId(tile);
+        if (tileId && BookmarksApi.available()) {
+            const removed = await BookmarksApi.removeTree(tileId);
+            if (removed) return;
+        }
+
+        const closeBtn = tile.querySelector(".close, .RemoveButton, [data-vivaldi-action='remove'], [aria-label='Remove']");
+        if (closeBtn) {
+            closeBtn.click();
         } else {
-            console.warn("[Vivaldi Swift] No native remove control found on this tile.");
+            console.warn("[Vivaldi Swift] Could not remove this Speed Dial — bookmarks API failed and no native remove control was found on the tile.");
         }
     }
 
@@ -942,15 +1772,122 @@ const ContextMenu = (() => {
 
 
 /* ============================================================
+   VisualDiagnostics
+   ============================================================
+   Everything above this point requires finding the correct
+   DevTools target (vivaldi://inspect/#apps/) before it's any use
+   at all — a real, confirmed obstacle in this project's own
+   troubleshooting so far. This renders the same information
+   directly on the page instead: a small corner badge, on by
+   default, that needs no console access to read at all.
+
+   Persistently dismissible per-profile (chrome.storage.local, same
+   store IconService already uses) so it doesn't have to be turned
+   off every session once things are confirmed working — but it
+   defaults ON, specifically because a debug aid nobody can
+   successfully turn on is worse than one that's mildly in the way
+   until dismissed once.
+   ============================================================ */
+
+const VisualDiagnostics = (() => {
+
+    const DISMISS_KEY = "vivaldi_swift_diagnostics_dismissed";
+    let _el = null;
+    let _dismissed = false;
+
+    async function init() {
+        try {
+            const result = await chrome.storage.local.get(DISMISS_KEY);
+            _dismissed = !!result[DISMISS_KEY];
+        } catch { /* default to shown if storage itself is unavailable */ }
+
+        if (_dismissed) return;
+        _render();
+        _tick();
+        setInterval(_tick, 1000);
+    }
+
+    function _render() {
+        _el = document.createElement("div");
+        _el.id = "vivaldi-swift-diagnostics";
+        Object.assign(_el.style, {
+            position: "fixed", bottom: "12px", right: "12px", zIndex: "999999",
+            background: "rgba(20,20,24,.92)", color: "#e8e8ec",
+            font: "11px/1.5 -apple-system,Segoe UI,sans-serif",
+            padding: "8px 10px", borderRadius: "8px", maxWidth: "300px",
+            boxShadow: "0 4px 16px rgba(0,0,0,.4)", pointerEvents: "auto",
+            whiteSpace: "pre-wrap",
+        });
+
+        const close = document.createElement("span");
+        close.textContent = "✕";
+        Object.assign(close.style, { float: "right", cursor: "pointer", marginLeft: "8px", opacity: ".7" });
+        close.title = "Dismiss (remembers this choice)";
+        close.addEventListener("click", _dismissBadge);
+
+        _el.appendChild(close);
+        const body = document.createElement("div");
+        body.className = "vivaldi-swift-diagnostics-body";
+        _el.appendChild(body);
+        document.body.appendChild(_el);
+    }
+
+    function _dismissBadge() {
+        _el?.remove();
+        _el = null;
+        try { chrome.storage.local.set({ [DISMISS_KEY]: true }); } catch { /* best-effort */ }
+    }
+
+    function _tick() {
+        if (!_el) return;
+        const body = _el.querySelector(".vivaldi-swift-diagnostics-body");
+        if (!body) return;
+
+        const folderLines = [...__diag.folders.entries()]
+            .slice(-4)
+            .map(([id, s]) => `  #${id}: ${s.childCount ?? "?"} children, ${s.resolvedCount ?? 0} resolved${s.injected ? " ✓shown" : ""}`)
+            .join("\n");
+
+        body.textContent =
+            `Vivaldi Swift — ${__diag.ready ? "ready" : "loading…"}\n` +
+            `bookmarks API: ${__diag.bookmarksApiAvailable === null ? "?" : (__diag.bookmarksApiAvailable ? "yes" : "no")}\n` +
+            `regular cards: ${__diag.regularCards.success}✓ ${__diag.regularCards.notFound}∅ ${__diag.regularCards.error}✗\n` +
+            `folders seen: ${__diag.folders.size}` +
+            (folderLines ? `\n${folderLines}` : "");
+    }
+
+    return { init };
+
+})();
+
+
+/* ============================================================
    OBSERVER + BOOTSTRAP  (self-contained IIFE)
    ============================================================
    Scoped, targeted mutation handling:
-     • Newly added .SpeedDial nodes → processed immediately.
-     • Subtree additions that might contain tiles → debounced
-       full processAll() for correctness.
-     • Removals and attribute mutations → ignored (nothing here
-       needs observer-driven teardown; AutoIconController already
-       re-checks tile identity when its async work resolves).
+     • Newly added .SpeedDial nodes, or nodes added *inside* an
+       existing one (e.g. a folder's native child-favicon list
+       changing in place — see FolderPreviewController's Part-18
+       content-change detection) → reprocess that owning tile.
+     • src/srcset/class attribute changes on anything inside a tile
+       (Vivaldi is expected to set a favicon's destination synchronously
+       at element-creation time in every case observed so far, but
+       nothing here assumes that always holds — if Vivaldi ever
+       populates it via a later attribute write instead of at
+       insertion, this is what catches that) → reprocess the owning
+       tile. attributeFilter keeps this from firing on unrelated
+       attribute churn elsewhere on the page.
+     • Larger subtree additions that might contain brand-new tiles
+       nested inside them (e.g. the whole grid re-rendering) →
+       debounced full processAll(), rather than reasoning about
+       every node in a bulk-inserted subtree individually.
+     • Every branch is idempotent — both controllers no-op when
+       nothing has actually changed, including reprocessing their
+       own just-inserted preview node once and immediately no-op'ing
+       on an unchanged signature — so redundant triggers (a childList
+       and several attribute mutations all landing for the same
+       folder in one batch) cost at most one real re-diff, deduped
+       below via the owners Set.
    ============================================================ */
 
 (() => {
@@ -958,41 +1895,70 @@ const ContextMenu = (() => {
     let _debounceTimer = null;
 
     function _onMutation(mutations) {
+        const owners = new Set();
+        let needsFullScan = false;
+
         for (const m of mutations) {
+            if (m.type === "attributes") {
+                const owner = m.target.nodeType === Node.ELEMENT_NODE
+                    ? m.target.closest?.(SELECTORS.speedDial)
+                    : null;
+                if (owner) owners.add(owner);
+                continue;
+            }
+
             if (m.type !== "childList" || !m.addedNodes.length) continue;
 
             for (const node of m.addedNodes) {
                 if (node.nodeType !== Node.ELEMENT_NODE) continue;
 
-                if (node.classList?.contains("SpeedDial")) {
-                    AutoIconController.process(node);
-                    continue;
-                }
+                const owner = node.closest?.(SELECTORS.speedDial);
+                if (owner) { owners.add(owner); continue; }
 
-                if (node.querySelector?.(".SpeedDial")) {
-                    clearTimeout(_debounceTimer);
-                    _debounceTimer = setTimeout(AutoIconController.processAll, OBSERVER_DEBOUNCE_MS);
-                    return; // one pending scan is enough
-                }
+                if (node.querySelector?.(SELECTORS.speedDial)) needsFullScan = true;
             }
+        }
+
+        // Every mutation in this batch that pointed at a specific tile is
+        // resolved to at most one process() call per tile, regardless of
+        // how many individual attribute/childList mutations it produced —
+        // this is the "batching" the naive per-mutation version lacked.
+        for (const owner of owners) SpeedDialIconController.process(owner);
+
+        if (needsFullScan) {
+            clearTimeout(_debounceTimer);
+            _debounceTimer = setTimeout(SpeedDialIconController.processAll, OBSERVER_DEBOUNCE_MS);
         }
     }
 
     const _observer = new MutationObserver(_onMutation);
-    _observer.observe(document, { childList: true, subtree: true });
+    _observer.observe(document, {
+        childList:      true,
+        subtree:        true,
+        attributes:     true,
+        attributeFilter: ["src", "srcset", "class"],
+    });
 
     async function _bootstrap() {
         ContextMenu.init();
+        VisualDiagnostics.init();
 
         await IconService.init();
 
         if (typeof requestIdleCallback === "function") {
-            requestIdleCallback(AutoIconController.processAll, { timeout: 500 });
+            requestIdleCallback(SpeedDialIconController.processAll, { timeout: 500 });
         } else {
-            AutoIconController.processAll();
+            SpeedDialIconController.processAll();
         }
 
+        __diag.ready = true;
+        __diag.bookmarksApiAvailable = BookmarksApi.available();
         console.log("[Vivaldi Swift] Ready.");
+        console.log(
+            `[Vivaldi Swift] Found ${document.querySelectorAll(SELECTORS.speedDial).length} tile(s) ` +
+            `(${document.querySelectorAll(`${SELECTORS.speedDial}.${SELECTORS.folderClass}`).length} folder(s)) on initial scan. ` +
+            `Type __vivaldiSwift in this console at any time for live diagnostics.`
+        );
     }
 
     if (document.readyState === "loading") {
