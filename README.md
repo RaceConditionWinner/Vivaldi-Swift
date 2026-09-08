@@ -48,8 +48,8 @@ Refined spacing, glass surfaces, and custom high-quality Speed Dial icons.
 
 ## Overview
 
-This CSS + JS mod gives the Vivaldi browser UI a liquid-glass redesign, plus the ability to set
-high-quality custom icons (SVG or PNG) for your Speed Dial cards, with per-icon position and scale.
+This CSS + JS mod gives the Vivaldi browser UI a liquid-glass redesign, plus automatically-resolved,
+high-quality SVG icons for your Speed Dial cards — no uploading, positioning, or scaling required.
 
 ## Installation
 
@@ -67,6 +67,25 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Utkarsh-tiwari27/Vivaldi-Swi
 ```powershell
 irm https://raw.githubusercontent.com/Utkarsh-tiwari27/Vivaldi-Swift/main/installers/install.ps1 | iex
 ```
+
+### Installing from a local copy instead of GitHub
+
+Both one-liners above always download `custom.js`/`vivaldi_swift.css` from this
+repo's `main` branch — that's by design for normal use, but it means **the
+one-liner is the wrong tool** for testing a local edit or a build someone
+handed you directly (a zip, a patch, a branch you haven't pushed yet): it
+will silently reinstall whatever is already on GitHub instead, with no error,
+which looks identical to "the fix didn't work." If you're testing files that
+aren't on `main` yet, point the installer at them directly instead:
+
+```bash
+VIVALDI_SWIFT_TEST_SOURCE=/path/to/the/folder/containing/those/two/files bash installers/install.sh
+```
+
+(`installers/install.sh` here means your local copy of this repo's script,
+not the piped-from-GitHub one-liner.) This applies the exact files in that
+folder, verifies the patch, and reports success/failure the same way the
+normal path does — the only difference is where the two files come from.
 
 The installer detects your Vivaldi installation, downloads `vivaldi_swift.css` and `custom.js`
 into a canonical local folder, patches Vivaldi's UI to load them, verifies the result, and tells
@@ -149,10 +168,13 @@ Resource folder paths:
 
 ## Custom Icons
 
-Right-click any Speed Dial tile → **Change Icon** to upload an SVG or PNG. Uploaded SVGs are
-sanitized (scripts, event handlers, and external references are stripped) before use. Use
-**Customize Layout** on the same menu to adjust icon size, position, padding, and scale; **Reset
-Icon** / **Reset Layout** revert to defaults.
+Speed Dial icons are resolved automatically — there's nothing to upload, position, or scale.
+Vivaldi Swift recovers each tile's target domain from Vivaldi's own favicon data and looks it up
+against [theSVG](https://thesvg.org), a free, open-licensed icon CDN. A match is sanitized (the
+same allowlist-based pass the old manual-upload feature used) and swapped in for the native
+favicon; anything that can't be resolved — an unlisted site, a network hiccup — just keeps
+Vivaldi's native favicon, automatically and silently. See [`icons/README.md`](icons/README.md)
+for how the lookup and caching work.
 
 ## FAQ
 
