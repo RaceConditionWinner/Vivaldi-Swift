@@ -624,11 +624,6 @@ box-shadow:
     inset:    0        !important;
 }
 
-/* Hide all folder preview icons except first */
-.thumbnail-favicon-folder .favicon {
-    display: none !important;
-}
-
 
 /* ============================================================
    NORMAL ICON SIZING
@@ -647,10 +642,11 @@ box-shadow:
    ============================================================ */
 
 .thumbnail-title {
-    color:       var(--title-color)                           !important;
-    font-size:   10px                                         !important;
-    font-weight: 300                                          !important;
-    text-shadow: 0 1px 2px var(--title-shadow)               !important;
+    color:          var(--title-color)                                        !important;
+    font-size:      12px                                                      !important;
+    font-weight:    500                                                       !important;
+    letter-spacing: .1px                                                      !important;
+    text-shadow:    0 1px 3px var(--title-shadow), 0 1px 8px rgba(0,0,0,.25)  !important;
 }
 
 
@@ -685,14 +681,12 @@ box-shadow:
 }
 
 
-/* ============================================================
-   FOLDER — Suppress folder preview children
-   ============================================================ */
-
-.SpeedDial.folder .thumbnail-favicon-children {
-    opacity:        0 !important;
-    pointer-events: none !important;
-}
+/* Folder previews: no blanket hide rule here anymore. Vivaldi's native
+   .thumbnail-favicon-children stays visible (real fallback, not just a
+   CSS-suppressed placeholder) until FolderPreviewController's JS sets
+   this element's own inline opacity to 0 — and only after it has
+   confirmed a complete replacement grid is already in the DOM. See
+   custom.js — FolderPreviewController. */
 
 
 /* ============================================================
@@ -785,6 +779,91 @@ box-shadow:
 /* Wildcard cleanup for nested SVG elements */
 .custom-icon-wrapper svg *,
 .custom-icon-wrapper--svg * {
+    box-shadow: none !important;
+}
+
+
+/* ============================================================
+   FOLDER PREVIEW GRID
+   ============================================================
+   .thumbnail-favicon-folder (the parent we're appended into)
+   already centers its children — natively via `place-content:
+   center`, and via this file's own "ICON POSITIONING" rule above
+   — the same way .custom-layout-wrapper centers the single-icon
+   case for regular tiles. So this grid is deliberately NOT
+   position:absolute/inset:0: it's sized to a small fixed square
+   per slot (--custom-folder-slot-size, tunable per the same
+   pattern --custom-icon-size uses for regular tiles) and just
+   lets the parent center it. Filling the whole (non-square,
+   ~90x64) container and dividing it with 1fr/percentage stretching
+   was the actual cause of uneven spacing in earlier versions —
+   icon size came out different in each direction because the
+   container isn't square.
+
+   Layout mode (grid vs flex, template columns/rows, grid-column
+   spans for the 3-icon case) is still set inline by
+   Renderer.renderFolderPreview() — those genuinely depend on how
+   many icons exist and read better as JS branches than as four
+   parallel CSS rulesets. Sizing, spacing, and the chrome-reset /
+   nested-SVG cleanup live here so they're tunable without touching
+   JS at all, matching this project's existing --custom-icon-size
+   convention.
+   ============================================================ */
+
+.vivaldi-swift-folder-preview {
+    position:      relative;
+    flex-shrink:   0;
+    pointer-events: none;
+    user-select:   none;
+    z-index:       1;
+    gap:           var(--custom-folder-gap, 3px);
+}
+
+.vivaldi-swift-folder-slot {
+    width:          var(--custom-folder-slot-size, 20px);
+    height:         var(--custom-folder-slot-size, 20px);
+    display:        flex;
+    align-items:    center;
+    justify-content: center;
+    overflow:       hidden;
+    border-radius:  3px;
+    flex-shrink:    0;
+    pointer-events: none;
+    background:      transparent !important;
+    border:          none        !important;
+    outline:         none        !important;
+    box-shadow:      none        !important;
+    backdrop-filter: none        !important;
+}
+
+/* renderSVG() reuses .custom-icon-wrapper (the regular single-icon
+   wrapper) for its sanitization/structure benefits — see FolderPreviewController's
+   header comment on why reusing the renderer beats a second one. That class's
+   own width/height default to --custom-icon-size (44px), sized for a regular
+   tile's much larger icon area. Inside a folder slot, its *immediate* parent
+   is this slot — not the tile — so it must be resized to match: a descendant
+   rule on the <svg> itself can't fix this, because percentage sizing always
+   resolves against the immediate parent (the wrapper), regardless of which
+   ancestor a selector happens to match. This is the one rule that actually
+   corrects it. */
+.vivaldi-swift-folder-slot .custom-icon-wrapper {
+    width:  100% !important;
+    height: 100% !important;
+}
+
+.vivaldi-swift-folder-slot svg,
+.vivaldi-swift-folder-slot img {
+    display:     block !important;
+    width:       100%  !important;
+    height:      100%  !important;
+    object-fit:  contain;
+    flex-shrink: 0      !important;
+    border:      none   !important;
+    outline:     none   !important;
+    box-shadow:  none   !important;
+}
+
+.vivaldi-swift-folder-slot svg * {
     box-shadow: none !important;
 }
 
@@ -957,272 +1036,13 @@ box-shadow:
    ------------------------------------------------------------------------------- */
 
 
+
 /* ===============================================================================
-   MODULE: Panel
-   Original File: panel.css
+   MODULE: Global Scrollbars
+   (Extracted from the old Side-Panel-only "Panel" module — this specific rule set
+   is unscoped and applies wherever a WebKit scrollbar renders, not just the Side
+   Panel, so it was kept when the rest of that module was removed.)
    =============================================================================== */
-
-/* ==========================================================================
-
-## PANEL SURFACE
-
-Vivaldi Panel Glass Theme
-Version: 3.0
-Status: Stable
-
-Notes:
-
-* Converted from JS test injection.
-* Visual values intentionally unchanged.
-* Layout untouched.
-* Auto-hide behavior preserved.
-* Web panel expansion preserved.
-
-============================================================================ */
-
-/* ==========================================================================
-PANEL RAIL
-============================================================================ */
-
-.auto-hide-wrapper.left {
-
-background:
-    linear-gradient(
-        180deg,
-        rgba(255,255,255,.04) 0%,
-        rgba(255,255,255,.015) 22%,
-        rgba(0,0,0,.10) 100%
-    ),
-    rgba(28,36,52,.82) !important;
-
-backdrop-filter:
-    blur(24px)
-    saturate(140%)
-    brightness(.92) !important;
-
--webkit-backdrop-filter:
-    blur(24px)
-    saturate(140%)
-    brightness(.92) !important;
-
-border:
-    1px solid rgba(255,255,255,.08) !important;
-
-box-shadow:
-    0 12px 40px rgba(0,0,0,.28),
-    inset 0 1px 0 rgba(255,255,255,.05) !important;
-
-}
-
-/* ==========================================================================
-PANEL CONTENT
-============================================================================ */
-
-.panel {
-
-background:
-    linear-gradient(
-        180deg,
-        rgba(255,255,255,.035) 0%,
-        rgba(255,255,255,.012) 20%,
-        rgba(0,0,0,.05) 100%
-    ),
-    rgba(36,48,72,.58) !important;
-
-backdrop-filter:
-    blur(18px)
-    saturate(130%) !important;
-
--webkit-backdrop-filter:
-    blur(18px)
-    saturate(130%) !important;
-
-}
-
-/* ==========================================================================
-WEB PANELS
-============================================================================ */
-
-.webpage {
-
-background:
-    linear-gradient(
-        180deg,
-        rgba(255,255,255,.03) 0%,
-        rgba(255,255,255,.01) 18%,
-        rgba(0,0,0,.05) 100%
-    ),
-    rgba(36,48,72,.52) !important;
-
-backdrop-filter:
-    blur(18px)
-    saturate(130%) !important;
-
--webkit-backdrop-filter:
-    blur(18px)
-    saturate(130%) !important;
-
-}
-
-/* ==========================================================================
-TYPOGRAPHY
-============================================================================ */
-
-.panel,
-.panel * {
-
-color:
-    rgba(248,250,255,.96);
-
-}
-
-small,
-.meta,
-.note-meta,
-.info,
-.secondary {
-
-color:
-    rgba(220,225,235,.72) !important;
-
-}
-
-/* ==========================================================================
-SEARCH FIELD
-============================================================================ */
-
-.notesearch {
-
-background:
-    rgba(255,255,255,.055) !important;
-
-border:
-    1px solid rgba(255,255,255,.08) !important;
-
-box-shadow:
-    inset 0 1px 0 rgba(255,255,255,.04);
-
-color:
-    rgba(255,255,255,.96) !important;
-
-}
-
-/* ==========================================================================
-DROPDOWNS
-============================================================================ */
-
-.sortselector {
-
-background:
-    rgba(255,255,255,.055) !important;
-
-border:
-    1px solid rgba(255,255,255,.08) !important;
-
-color:
-    rgba(255,255,255,.96) !important;
-
-}
-
-/* ==========================================================================
-PANEL ICON CAPSULES
-============================================================================ */
-
-.auto-hide-wrapper.left .ToolbarButton-Button {
-
-background:
-    rgba(255,255,255,.055) !important;
-
-border:
-    1px solid rgba(255,255,255,.08) !important;
-
-border-radius:
-    14px !important;
-
-box-shadow:
-    inset 0 1px 0 rgba(255,255,255,.04);
-
-transition:
-    all .18s ease;
-
-}
-
-.auto-hide-wrapper.left .ToolbarButton-Button:hover {
-
-background:
-    rgba(255,255,255,.09) !important;
-
-border-color:
-    rgba(255,255,255,.12) !important;
-
-}
-
-/* ==========================================================================
-TREE ITEMS
-============================================================================ */
-
-.tree-row {
-
-border-radius:
-    12px !important;
-
-}
-
-.tree-row:hover {
-
-background:
-    rgba(255,255,255,.055) !important;
-
-}
-
-.tree-row-selected {
-
-background:
-    rgba(255,255,255,.10) !important;
-
-border:
-    1px solid rgba(255,255,255,.08) !important;
-
-}
-
-/* ==========================================================================
-BADGES
-============================================================================ */
-
-.item-count {
-
-background:
-    rgba(255,255,255,.08) !important;
-
-border:
-    1px solid rgba(255,255,255,.08) !important;
-
-}
-
-/* ==========================================================================
-NOTES EDITOR
-============================================================================ */
-
-.NotesEditor-Editor {
-
-background:
-    rgba(0,0,0,.18) !important;
-
-color:
-    rgba(255,255,255,.96) !important;
-
-}
-
-/* ==========================================================================
-FOOTER / METADATA
-============================================================================ */
-
-.NotesEditor-Metadata {
-
-opacity:
-    .82;
-
-}
 
 /* ==========================================================================
 SCROLLBARS
@@ -1252,9 +1072,6 @@ background:
 
 }
 
-/* -------------------------------------------------------------------------------
-   END MODULE: Panel
-   ------------------------------------------------------------------------------- */
 .UrlBar-AddressField input {
     text-align: center !important;
 }
