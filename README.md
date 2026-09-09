@@ -68,31 +68,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Utkarsh-tiwari27/Vivaldi-Swi
 irm https://raw.githubusercontent.com/Utkarsh-tiwari27/Vivaldi-Swift/main/installers/install.ps1 | iex
 ```
 
-### Installing from a local copy instead of GitHub
 
-Both one-liners above always download `custom.js`/`vivaldi_swift.css` from this
-repo's `main` branch — that's by design for normal use, but it means **the
-one-liner is the wrong tool** for testing a local edit or a build someone
-handed you directly (a zip, a patch, a branch you haven't pushed yet): it
-will silently reinstall whatever is already on GitHub instead, with no error,
-which looks identical to "the fix didn't work." If you're testing files that
-aren't on `main` yet, point the installer at them directly instead:
-
-```bash
-VIVALDI_SWIFT_TEST_SOURCE=/path/to/the/folder/containing/those/two/files bash installers/install.sh
-```
-
-(`installers/install.sh` here means your local copy of this repo's script,
-not the piped-from-GitHub one-liner.) This applies the exact files in that
-folder, verifies the patch, and reports success/failure the same way the
-normal path does — the only difference is where the two files come from.
-
-The installer detects your Vivaldi installation, downloads `vivaldi_swift.css` and `custom.js`
-into a canonical local folder, patches Vivaldi's UI to load them, verifies the result, and tells
-you when it's done. If it needs administrator/root privileges to write to your Vivaldi install, it
-will ask for them at that point — never for anything outside your Vivaldi installation.
-
-Restart Vivaldi afterwards to see the change.
 
 ### Where files go
 
@@ -115,26 +91,6 @@ deploys a copy of it into Vivaldi's own resource folder:
 `~/Vivaldi-Swift` always belongs to your normal user account, even if the installer needed
 `sudo`/administrator rights to reach the Vivaldi folder itself.
 
-## Supported installations
-
-| Type | Support |
-|---|---|
-| Linux — official `.deb` / `.rpm` (installs under `/opt`) | ✅ Full |
-| macOS — `/Applications` or `~/Applications`, incl. Homebrew Cask | ✅ Full |
-| Windows — per-user (`%LocalAppData%`) or per-machine (`Program Files`) | ✅ Full |
-| Linux Snap | ❌ Not supported — Vivaldi's files are mounted read-only |
-| Linux/macOS Flatpak | ❌ Not supported — same reason |
-
-Snap and Flatpak builds sandbox Vivaldi's application files in a way that makes patching
-`window.html` impossible without breaking the package's integrity checks. If you're on one of
-these and want Vivaldi Swift, the most reliable path today is switching to the official `.deb`/`.rpm`
-or `.app` build.
-
-If more than one native Vivaldi installation is found (for example both a per-user and a
-per-machine install on Windows, or Stable alongside Snapshot on Linux), the installer won't guess
-— it lists what it found and asks you to remove or rename the one you don't use before rerunning.
-
-## Updating
 
 **Vivaldi Swift itself:** rerun the same install command above. It always fetches the current
 `vivaldi_swift.css` and `custom.js` from this repository, updates the canonical copy under
@@ -161,10 +117,6 @@ script to keep in sync with the installer. To remove it:
 3. Optionally delete the `~/Vivaldi-Swift` folder itself.
 4. Restart Vivaldi.
 
-Resource folder paths:
-- Linux: `<install>/resources/vivaldi/` (e.g. `/opt/vivaldi/resources/vivaldi/`)
-- macOS: `Vivaldi.app/Contents/Resources/vivaldi/`
-- Windows: `...\Vivaldi\Application\<version>\resources\vivaldi\`
 
 ## Custom Icons
 
