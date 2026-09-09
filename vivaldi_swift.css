@@ -867,6 +867,63 @@ box-shadow:
     box-shadow: none !important;
 }
 
+
+/* ============================================================
+   REPOSITION MODE
+   ============================================================
+   Purely a visual affordance — see custom.js's RepositionMode for
+   why this never touches drag event handling itself. Every tile
+   gets an outline + grab cursor while active, and a small banner
+   explains how to exit. Vivaldi's own tile still owns the actual
+   drag gesture throughout, so this must never set pointer-events
+   or intercept anything that could interfere with that.
+   ============================================================ */
+
+body.vivaldi-swift-reposition-mode .SpeedDial {
+    outline:        1.5px dashed rgba(255, 255, 255, .45) !important;
+    outline-offset: 2px                                    !important;
+    cursor:         grab                                   !important;
+    border-radius:  inherit;
+}
+
+body.vivaldi-swift-reposition-mode .SpeedDial:active {
+    cursor: grabbing !important;
+}
+
+.vivaldi-swift-reposition-banner {
+    position:        fixed;
+    left:            50%;
+    bottom:          20px;
+    translate:       -50% 0;
+    z-index:         999999;
+    display:         flex;
+    align-items:     center;
+    gap:             10px;
+    padding:         8px 10px 8px 14px;
+    background:      rgba(20, 20, 24, .92);
+    color:           #e8e8ec;
+    font:            12px/1.4 -apple-system, "Segoe UI", sans-serif;
+    border-radius:   999px;
+    box-shadow:      0 6px 20px rgba(0, 0, 0, .35);
+    pointer-events:  auto;
+}
+
+.vivaldi-swift-reposition-banner button {
+    appearance:    none;
+    border:        none;
+    border-radius: 999px;
+    padding:       5px 12px;
+    background:    rgba(255, 255, 255, .14);
+    color:         inherit;
+    font:          inherit;
+    font-weight:   600;
+    cursor:        pointer;
+}
+
+.vivaldi-swift-reposition-banner button:hover {
+    background: rgba(255, 255, 255, .22);
+}
+
 /* -------------------------------------------------------------------------------
    END MODULE: Speed Dial
    ------------------------------------------------------------------------------- */
