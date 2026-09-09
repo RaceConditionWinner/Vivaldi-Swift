@@ -97,27 +97,6 @@ deploys a copy of it into Vivaldi's own resource folder:
 `~/Vivaldi-Swift`, and redeploys it. If nothing has actually changed, it says so and exits without
 touching anything.
 
-**After Vivaldi updates:** a Vivaldi update replaces `window.html`, which removes the patch (this
-is a Vivaldi limitation, not something Vivaldi Swift can prevent — see [FAQ](#faq)). Rerun the same
-install command to reapply it. There is intentionally no background service watching for this; see
-the FAQ for why. (A repair step that reuses the canonical `~/Vivaldi-Swift` copy automatically after
-an update is planned but not implemented yet — today, rerunning the command is the update path.)
-
-## Uninstalling
-
-Vivaldi Swift is two files plus a small marked block in one Vivaldi file — there's no uninstall
-script to keep in sync with the installer. To remove it:
-
-1. Open `window.html` in your Vivaldi resources folder (see paths below) and delete everything
-   between and including the `<!-- VIVALDI_SWIFT_START -->` and `<!-- VIVALDI_SWIFT_END -->` lines
-   — or just restore it from the backup the installer made at
-   `~/Vivaldi-Swift/backups/window.html.orig` (`%USERPROFILE%\Vivaldi-Swift\backups\window.html.orig`
-   on Windows).
-2. Delete `vivaldi_swift.css` and `custom.js` from that same Vivaldi resources folder.
-3. Optionally delete the `~/Vivaldi-Swift` folder itself.
-4. Restart Vivaldi.
-
-
 ## Custom Icons
 
 Speed Dial icons are resolved automatically — there's nothing to upload, position, or scale.
