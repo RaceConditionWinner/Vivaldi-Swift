@@ -34,7 +34,7 @@ Refined spacing, glass surfaces, and custom high-quality Speed Dial icons.
 <table align="center">
 <tr>
 <td align="center" width="50%">
-<img src="https://github.com/user-attachments/assets/eb892458-3671-48e7-8064-c36609c62e05" alt="Vivaldi Swift Browser UI" width="480"><br>
+<img src="https://github.com/user-attachments/assets/8ef7915d-40f7-47e3-b427-14fc551db6f2" alt="Vivaldi Swift Browser UI" width="480"><br>
 <sub><b>Browser UI</b></sub>
 </td>
 <td align="center" width="50%">
@@ -155,3 +155,13 @@ block and one backup.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+
+
+
+
+
+
+
+
+
