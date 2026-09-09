@@ -61,6 +61,13 @@
                                 feature used; unchanged and reused
      Renderer                 → builds/injects both the single-icon
                                 and the folder-grid wrapper hierarchies
+     ContextMenu               → Add Speed Dial / Add Folder (via
+                                BookmarksApi.create), Change Position,
+                                Remove Speed Dial (via removeTree)
+     RepositionMode            → visual on/off affordance around
+                                Vivaldi's own native tile dragging —
+                                deliberately does not reimplement
+                                drag-and-drop itself; see its header
 
    No version numbers here — git history is the changelog.
    ============================================================ */
@@ -651,7 +658,28 @@ const BookmarksApi = (() => {
         });
     }
 
-    return { available, get, getChildren, removeTree };
+    /**
+     * Creates a new bookmark (a Speed Dial tile) or folder as a sibling
+     * of an existing node — used for the "Add Speed Dial" / "Add Folder"
+     * context menu actions.
+     * @param {{parentId:string, title:string, url?:string, index?:number}} details
+     *        omit `url` to create a folder instead of a regular tile
+     * @returns {Promise<object|null>} the created node, or null on failure
+     */
+    function create(details) {
+        return new Promise(resolve => {
+            try {
+                chrome.bookmarks.create(details, node => {
+                    if (chrome.runtime.lastError) { resolve(null); return; }
+                    resolve(node || null);
+                });
+            } catch {
+                resolve(null);
+            }
+        });
+    }
+
+    return { available, get, getChildren, removeTree, create };
 
 })();
 
@@ -1650,6 +1678,20 @@ const SpeedDialIconController = (() => {
    is no supported public API for it, so this stays a thin
    shortcut rather than a reimplementation. Icon assignment is no
    longer a manual action, so this menu no longer offers it.
+
+   Add Speed Dial / Add Folder go through chrome.bookmarks.create()
+   — the same API BookmarksApi already uses elsewhere — since a
+   Speed Dial tile IS a bookmark node; Vivaldi's own reactive UI
+   picks up the new node and renders it, no DOM manipulation needed.
+
+   Change Position does not implement its own drag-and-drop. Vivaldi
+   already does — every tile's own class list includes "draggable",
+   and its real onDragStart/onDragOver/onDrop handlers already
+   reorder tiles by dragging (confirmed directly from Vivaldi's own
+   source). Reimplementing that would mean fighting React for control
+   of the same gesture on the same elements, which is a losing,
+   flicker-prone fight, not a feature — see RepositionMode below for
+   what this does instead.
    ============================================================ */
 
 const ContextMenu = (() => {
@@ -1690,8 +1732,35 @@ const ContextMenu = (() => {
               stroke-linecap="round" stroke-linejoin="round"/>
     </svg>`;
 
+    const _ADD_DIAL_SVG = `<svg class="swift-menu-icon-svg" viewBox="0 0 16 16" fill="none">
+        <rect x="2.5" y="2.5" width="11" height="11" rx="2"
+              stroke="currentColor" stroke-width="1.25"/>
+        <path d="M8 5.5v5M5.5 8h5" stroke="currentColor" stroke-width="1.25" stroke-linecap="round"/>
+    </svg>`;
+
+    const _ADD_FOLDER_SVG = `<svg class="swift-menu-icon-svg" viewBox="0 0 16 16" fill="none">
+        <path d="M2.5 4.5A1 1 0 0 1 3.5 3.5h3l1.2 1.6h4.8a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1h-9a1 1 0 0 1-1-1z"
+              stroke="currentColor" stroke-width="1.25" stroke-linejoin="round"/>
+        <path d="M8 8v3M6.5 9.5h3" stroke="currentColor" stroke-width="1.25" stroke-linecap="round"/>
+    </svg>`;
+
+    const _MOVE_SVG = `<svg class="swift-menu-icon-svg" viewBox="0 0 16 16" fill="none">
+        <path d="M8 2.5v11M2.5 8h11M4.5 5l-2 3 2 3M11.5 5l2 3-2 3M5 4.5l3-2 3 2M5 11.5l3 2 3-2"
+              stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>`;
+
     function _render() {
         _el.innerHTML = `
+            <div class="swift-menu-item" data-action="add-sd">
+                ${_ADD_DIAL_SVG}<span>Add Speed Dial</span>
+            </div>
+            <div class="swift-menu-item" data-action="add-folder">
+                ${_ADD_FOLDER_SVG}<span>Add Folder</span>
+            </div>
+            <div class="swift-menu-item" data-action="reposition">
+                ${_MOVE_SVG}<span>Change Position</span>
+            </div>
+            <div class="swift-menu-separator"></div>
             <div class="swift-menu-item swift-menu-item--danger" data-action="remove-sd">
                 ${_REMOVE_SVG}<span>Remove Speed Dial</span>
             </div>`;
@@ -1720,7 +1789,74 @@ const ContextMenu = (() => {
         _dismiss();
         if (!tile) return;
 
-        if (item.dataset.action === "remove-sd") _removeSpeedDial(tile);
+        switch (item.dataset.action) {
+            case "remove-sd":   _removeSpeedDial(tile); break;
+            case "add-sd":      _addSpeedDial(tile);    break;
+            case "add-folder":  _addFolder(tile);       break;
+            case "reposition":  RepositionMode.enter(); break;
+        }
+    }
+
+    /**
+     * New tiles are created as a sibling immediately after the
+     * right-clicked one — same parent folder (or the top-level Speed
+     * Dial root if the tile isn't nested), next index. There's no
+     * reliable DOM fallback for creation the way .close is for
+     * removal (no generic "add" button to guess a selector for), so
+     * this is bookmarks-API-only; it fails visibly (an alert) rather
+     * than silently if that API isn't available.
+     */
+    async function _addSpeedDial(tile) {
+        const parent = await _siblingParent(tile);
+        if (!parent) return _createUnavailable();
+
+        const title = prompt("Title for the new Speed Dial:", "");
+        if (title === null) return; // cancelled
+        const url = prompt("URL for the new Speed Dial:", "https://");
+        if (url === null) return; // cancelled
+
+        const cleanedUrl = FaviconUrl.cleanHttpUrl(url);
+        if (!cleanedUrl) { alert("That doesn't look like a valid http(s) URL."); return; }
+
+        const created = await BookmarksApi.create({
+            parentId: parent.parentId,
+            index:    parent.index,
+            title:    title || cleanedUrl,
+            url:      cleanedUrl,
+        });
+        if (!created) _createUnavailable();
+    }
+
+    async function _addFolder(tile) {
+        const parent = await _siblingParent(tile);
+        if (!parent) return _createUnavailable();
+
+        const title = prompt("Folder name:", "New Folder");
+        if (title === null) return; // cancelled
+
+        const created = await BookmarksApi.create({
+            parentId: parent.parentId,
+            index:    parent.index,
+            title:    title || "New Folder",
+            // omitting `url` is what makes chrome.bookmarks.create() a folder
+        });
+        if (!created) _createUnavailable();
+    }
+
+    /** @returns {Promise<{parentId:string, index:number}|null>} */
+    async function _siblingParent(tile) {
+        if (!BookmarksApi.available()) return null;
+        const tileId = getTileId(tile);
+        if (!tileId) return null;
+
+        const node = await BookmarksApi.get(tileId);
+        if (!node?.parentId) return null;
+
+        return { parentId: node.parentId, index: (node.index ?? 0) + 1 };
+    }
+
+    function _createUnavailable() {
+        alert("Vivaldi Swift couldn't create that — the bookmarks API isn't available right now.");
     }
 
     /**
@@ -1767,6 +1903,82 @@ const ContextMenu = (() => {
     }
 
     return { init };
+
+})();
+
+
+/* ============================================================
+   RepositionMode
+   ============================================================
+   A discoverable, deliberate wrapper around Vivaldi's own native
+   tile dragging (see ContextMenu's header comment for why this
+   doesn't reimplement dragging itself). Activating it does exactly
+   two things, neither of which touches drag mechanics at all:
+     1. Adds a body-level class so CSS can visually mark every tile
+        as "this is draggable right now" (outline + grab cursor).
+     2. Shows a small dismissible banner explaining that and how to
+        exit — Escape, the banner's own button, or a plain click
+        anywhere outside a tile.
+   Native dragging is not actually gated behind this — it works
+   the same with or without this mode active, exactly as it always
+   has ("existing workflow continues to work as-is"). What this adds
+   is purely the guided, explicit on/off affordance that was asked
+   for, without the risk of a second system fighting React for
+   control of the same gesture.
+   ============================================================ */
+
+const RepositionMode = (() => {
+
+    const ACTIVE_CLASS = "vivaldi-swift-reposition-mode";
+    let _banner = null;
+    let _active = false;
+
+    function enter() {
+        if (_active) return;
+        _active = true;
+
+        document.body.classList.add(ACTIVE_CLASS);
+        _showBanner();
+
+        document.addEventListener("keydown", _onKeydown);
+        // Capture phase, and only acts on clicks outside any tile — this
+        // must never swallow the click that starts a native drag.
+        document.addEventListener("click", _onDocClick, true);
+    }
+
+    function exit() {
+        if (!_active) return;
+        _active = false;
+
+        document.body.classList.remove(ACTIVE_CLASS);
+        _banner?.remove();
+        _banner = null;
+
+        document.removeEventListener("keydown", _onKeydown);
+        document.removeEventListener("click", _onDocClick, true);
+    }
+
+    function _showBanner() {
+        _banner = document.createElement("div");
+        _banner.className = "vivaldi-swift-reposition-banner";
+        _banner.innerHTML = `
+            <span>Drag any Speed Dial to reposition it.</span>
+            <button type="button">Done</button>`;
+        _banner.querySelector("button").addEventListener("click", exit);
+        document.body.appendChild(_banner);
+    }
+
+    function _onKeydown(e) {
+        if (e.key === "Escape") exit();
+    }
+
+    function _onDocClick(e) {
+        if (!e.target.closest(SELECTORS.speedDial) && !e.target.closest(".vivaldi-swift-reposition-banner")) {
+            exit();
+        }
+    }
+
+    return { enter, exit };
 
 })();
 
