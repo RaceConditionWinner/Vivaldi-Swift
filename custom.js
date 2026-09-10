@@ -62,12 +62,13 @@
      Renderer                 → builds/injects both the single-icon
                                 and the folder-grid wrapper hierarchies
      ContextMenu               → Add Speed Dial / Add Folder (via
-                                BookmarksApi.create), Change Position,
-                                Remove Speed Dial (via removeTree)
-     RepositionMode            → visual on/off affordance around
-                                Vivaldi's own native tile dragging —
-                                deliberately does not reimplement
-                                drag-and-drop itself; see its header
+                                BookmarksApi.create), Remove Speed
+                                Dial (via removeTree)
+     Dialog                    → small in-page modal for the Add
+                                actions' title/URL input — not
+                                window.prompt(), see its own header
+     Toast                     → small auto-dismissing notification
+                                for errors — not window.alert()
 
    No version numbers here — git history is the changelog.
    ============================================================ */
@@ -1671,6 +1672,166 @@ const SpeedDialIconController = (() => {
 
 
 /* ============================================================
+   Toast
+   ============================================================
+   Small, auto-dismissing notification for messages that don't
+   warrant a modal (e.g. "couldn't create that"). Not built on
+   window.alert() — see Dialog's header comment for why.
+   ============================================================ */
+
+const Toast = (() => {
+
+    function show(message, durationMs = 4000) {
+        const el = document.createElement("div");
+        el.className = "vivaldi-swift-toast";
+        el.textContent = message;
+        document.body.appendChild(el);
+
+        requestAnimationFrame(() => el.classList.add("vivaldi-swift-toast--in"));
+
+        setTimeout(() => {
+            el.classList.remove("vivaldi-swift-toast--in");
+            // Guaranteed removal even under prefers-reduced-motion, where
+            // the transition (and therefore transitionend) never fires.
+            el.addEventListener("transitionend", () => el.remove(), { once: true });
+            setTimeout(() => el.remove(), 300);
+        }, durationMs);
+    }
+
+    return { show };
+
+})();
+
+
+/* ============================================================
+   Dialog
+   ============================================================
+   A small in-page modal for collecting text input — title/URL for
+   Add Speed Dial, a name for Add Folder. Deliberately not built on
+   window.prompt(): native JS dialogs (alert/confirm/prompt) are
+   documented as unreliable to fully blocked in extension and
+   app-style page contexts — exactly what window.html is, a
+   chrome-extension:// origin — which is why the first version of
+   the Add actions silently did nothing no matter what was typed.
+
+   Promise-based, matching the rest of this file's async style:
+   resolves with the field values on submit, or null on cancel
+   (Escape, the Cancel button, or a click on the overlay backdrop).
+   Validation is the caller's job (passed in as `validate`) so this
+   stays a generic, reusable field-collector rather than knowing
+   anything about bookmarks or URLs itself.
+   ============================================================ */
+
+const Dialog = (() => {
+
+    /**
+     * @param {{
+     *   title: string,
+     *   fields: Array<{name:string, label:string, placeholder?:string, value?:string}>,
+     *   submitLabel?: string,
+     *   validate?: (values: Record<string,string>) => string|null
+     * }} options
+     * @returns {Promise<Record<string,string>|null>}
+     */
+    function prompt({ title, fields, submitLabel = "Create", validate }) {
+        return new Promise(resolve => {
+            const overlay = document.createElement("div");
+            overlay.className = "vivaldi-swift-dialog-overlay";
+
+            const box = document.createElement("div");
+            box.className = "vivaldi-swift-dialog";
+            box.setAttribute("role", "dialog");
+            box.setAttribute("aria-modal", "true");
+
+            const heading = document.createElement("div");
+            heading.className = "vivaldi-swift-dialog-title";
+            heading.textContent = title;
+            box.appendChild(heading);
+
+            const inputs = {};
+            for (const f of fields) {
+                const field = document.createElement("label");
+                field.className = "vivaldi-swift-dialog-field";
+
+                const labelText = document.createElement("span");
+                labelText.textContent = f.label;
+
+                const input = document.createElement("input");
+                input.type = "text";
+                input.placeholder = f.placeholder || "";
+                input.value = f.value || "";
+                input.autocomplete = "off";
+                input.spellcheck = false;
+
+                field.append(labelText, input);
+                box.appendChild(field);
+                inputs[f.name] = input;
+            }
+
+            const error = document.createElement("div");
+            error.className = "vivaldi-swift-dialog-error";
+            box.appendChild(error);
+
+            const actions = document.createElement("div");
+            actions.className = "vivaldi-swift-dialog-actions";
+
+            const cancelBtn = document.createElement("button");
+            cancelBtn.type = "button";
+            cancelBtn.className = "vivaldi-swift-dialog-btn vivaldi-swift-dialog-btn--cancel";
+            cancelBtn.textContent = "Cancel";
+
+            const submitBtn = document.createElement("button");
+            submitBtn.type = "button";
+            submitBtn.className = "vivaldi-swift-dialog-btn vivaldi-swift-dialog-btn--submit";
+            submitBtn.textContent = submitLabel;
+
+            actions.append(cancelBtn, submitBtn);
+            box.appendChild(actions);
+            overlay.appendChild(box);
+            document.body.appendChild(overlay);
+
+            const finish = result => {
+                overlay.remove();
+                document.removeEventListener("keydown", onKeydown);
+                resolve(result);
+            };
+
+            const submit = () => {
+                const values = {};
+                for (const name in inputs) values[name] = inputs[name].value.trim();
+
+                const errMsg = validate ? validate(values) : null;
+                if (errMsg) {
+                    error.textContent = errMsg;
+                    error.classList.add("vivaldi-swift-dialog-error--visible");
+                    return;
+                }
+                finish(values);
+            };
+
+            const cancel = () => finish(null);
+
+            function onKeydown(e) {
+                if (e.key === "Escape") { e.preventDefault(); cancel(); }
+                else if (e.key === "Enter" && e.target.tagName === "INPUT") { e.preventDefault(); submit(); }
+            }
+
+            cancelBtn.addEventListener("click", cancel);
+            submitBtn.addEventListener("click", submit);
+            overlay.addEventListener("mousedown", e => { if (e.target === overlay) cancel(); });
+            document.addEventListener("keydown", onKeydown);
+
+            const firstInput = box.querySelector("input");
+            requestAnimationFrame(() => firstInput?.focus());
+        });
+    }
+
+    return { prompt };
+
+})();
+
+
+/* ============================================================
    ContextMenu
    ============================================================
    Vivaldi already owns Speed Dial deletion — clicking its own
@@ -1683,15 +1844,11 @@ const SpeedDialIconController = (() => {
    — the same API BookmarksApi already uses elsewhere — since a
    Speed Dial tile IS a bookmark node; Vivaldi's own reactive UI
    picks up the new node and renders it, no DOM manipulation needed.
-
-   Change Position does not implement its own drag-and-drop. Vivaldi
-   already does — every tile's own class list includes "draggable",
-   and its real onDragStart/onDragOver/onDrop handlers already
-   reorder tiles by dragging (confirmed directly from Vivaldi's own
-   source). Reimplementing that would mean fighting React for control
-   of the same gesture on the same elements, which is a losing,
-   flicker-prone fight, not a feature — see RepositionMode below for
-   what this does instead.
+   Title/URL input goes through the Dialog module, not
+   window.prompt()/alert() — those are unreliable-to-fully-blocked
+   in extension/app-style page contexts like this one (window.html
+   is a chrome-extension:// origin), which is exactly why the first
+   version of this silently did nothing.
    ============================================================ */
 
 const ContextMenu = (() => {
@@ -1721,7 +1878,7 @@ const ContextMenu = (() => {
         e.stopImmediatePropagation();
 
         _activeTile = tile;
-        _render();
+        _render(tile);
         _position(e.clientX, e.clientY);
     }
 
@@ -1744,26 +1901,29 @@ const ContextMenu = (() => {
         <path d="M8 8v3M6.5 9.5h3" stroke="currentColor" stroke-width="1.25" stroke-linecap="round"/>
     </svg>`;
 
-    const _MOVE_SVG = `<svg class="swift-menu-icon-svg" viewBox="0 0 16 16" fill="none">
-        <path d="M8 2.5v11M2.5 8h11M4.5 5l-2 3 2 3M11.5 5l2 3-2 3M5 4.5l3-2 3 2M5 11.5l3 2 3-2"
-              stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round"/>
-    </svg>`;
+    function _tileTitle(tile) {
+        return tile.querySelector(".button-title")?.textContent?.trim() || "";
+    }
 
-    function _render() {
+    function _render(tile) {
+        const title = _tileTitle(tile);
         _el.innerHTML = `
+            ${title ? `<div class="swift-menu-header">${_escapeHtml(title)}</div>
+                       <div class="swift-menu-separator"></div>` : ""}
             <div class="swift-menu-item" data-action="add-sd">
                 ${_ADD_DIAL_SVG}<span>Add Speed Dial</span>
             </div>
             <div class="swift-menu-item" data-action="add-folder">
                 ${_ADD_FOLDER_SVG}<span>Add Folder</span>
             </div>
-            <div class="swift-menu-item" data-action="reposition">
-                ${_MOVE_SVG}<span>Change Position</span>
-            </div>
             <div class="swift-menu-separator"></div>
             <div class="swift-menu-item swift-menu-item--danger" data-action="remove-sd">
                 ${_REMOVE_SVG}<span>Remove Speed Dial</span>
             </div>`;
+    }
+
+    function _escapeHtml(s) {
+        return s.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
     }
 
     function _position(x, y) {
@@ -1793,7 +1953,6 @@ const ContextMenu = (() => {
             case "remove-sd":   _removeSpeedDial(tile); break;
             case "add-sd":      _addSpeedDial(tile);    break;
             case "add-folder":  _addFolder(tile);       break;
-            case "reposition":  RepositionMode.enter(); break;
         }
     }
 
@@ -1803,25 +1962,29 @@ const ContextMenu = (() => {
      * Dial root if the tile isn't nested), next index. There's no
      * reliable DOM fallback for creation the way .close is for
      * removal (no generic "add" button to guess a selector for), so
-     * this is bookmarks-API-only; it fails visibly (an alert) rather
+     * this is bookmarks-API-only; it fails visibly (a toast) rather
      * than silently if that API isn't available.
      */
     async function _addSpeedDial(tile) {
         const parent = await _siblingParent(tile);
         if (!parent) return _createUnavailable();
 
-        const title = prompt("Title for the new Speed Dial:", "");
-        if (title === null) return; // cancelled
-        const url = prompt("URL for the new Speed Dial:", "https://");
-        if (url === null) return; // cancelled
+        const values = await Dialog.prompt({
+            title: "Add Speed Dial",
+            fields: [
+                { name: "title", label: "Title", placeholder: "e.g. GitHub" },
+                { name: "url",   label: "URL",   placeholder: "https://" },
+            ],
+            submitLabel: "Add",
+            validate: v => FaviconUrl.cleanHttpUrl(v.url) ? null : "Enter a valid http:// or https:// URL.",
+        });
+        if (!values) return; // cancelled
 
-        const cleanedUrl = FaviconUrl.cleanHttpUrl(url);
-        if (!cleanedUrl) { alert("That doesn't look like a valid http(s) URL."); return; }
-
+        const cleanedUrl = FaviconUrl.cleanHttpUrl(values.url);
         const created = await BookmarksApi.create({
             parentId: parent.parentId,
             index:    parent.index,
-            title:    title || cleanedUrl,
+            title:    values.title || cleanedUrl,
             url:      cleanedUrl,
         });
         if (!created) _createUnavailable();
@@ -1831,13 +1994,18 @@ const ContextMenu = (() => {
         const parent = await _siblingParent(tile);
         if (!parent) return _createUnavailable();
 
-        const title = prompt("Folder name:", "New Folder");
-        if (title === null) return; // cancelled
+        const values = await Dialog.prompt({
+            title: "Add Folder",
+            fields: [{ name: "title", label: "Name", placeholder: "New Folder", value: "New Folder" }],
+            submitLabel: "Add",
+            validate: v => v.title ? null : "Enter a folder name.",
+        });
+        if (!values) return; // cancelled
 
         const created = await BookmarksApi.create({
             parentId: parent.parentId,
             index:    parent.index,
-            title:    title || "New Folder",
+            title:    values.title,
             // omitting `url` is what makes chrome.bookmarks.create() a folder
         });
         if (!created) _createUnavailable();
@@ -1856,7 +2024,7 @@ const ContextMenu = (() => {
     }
 
     function _createUnavailable() {
-        alert("Vivaldi Swift couldn't create that — the bookmarks API isn't available right now.");
+        Toast.show("Vivaldi Swift couldn't create that — the bookmarks API isn't available right now.");
     }
 
     /**
@@ -1903,82 +2071,6 @@ const ContextMenu = (() => {
     }
 
     return { init };
-
-})();
-
-
-/* ============================================================
-   RepositionMode
-   ============================================================
-   A discoverable, deliberate wrapper around Vivaldi's own native
-   tile dragging (see ContextMenu's header comment for why this
-   doesn't reimplement dragging itself). Activating it does exactly
-   two things, neither of which touches drag mechanics at all:
-     1. Adds a body-level class so CSS can visually mark every tile
-        as "this is draggable right now" (outline + grab cursor).
-     2. Shows a small dismissible banner explaining that and how to
-        exit — Escape, the banner's own button, or a plain click
-        anywhere outside a tile.
-   Native dragging is not actually gated behind this — it works
-   the same with or without this mode active, exactly as it always
-   has ("existing workflow continues to work as-is"). What this adds
-   is purely the guided, explicit on/off affordance that was asked
-   for, without the risk of a second system fighting React for
-   control of the same gesture.
-   ============================================================ */
-
-const RepositionMode = (() => {
-
-    const ACTIVE_CLASS = "vivaldi-swift-reposition-mode";
-    let _banner = null;
-    let _active = false;
-
-    function enter() {
-        if (_active) return;
-        _active = true;
-
-        document.body.classList.add(ACTIVE_CLASS);
-        _showBanner();
-
-        document.addEventListener("keydown", _onKeydown);
-        // Capture phase, and only acts on clicks outside any tile — this
-        // must never swallow the click that starts a native drag.
-        document.addEventListener("click", _onDocClick, true);
-    }
-
-    function exit() {
-        if (!_active) return;
-        _active = false;
-
-        document.body.classList.remove(ACTIVE_CLASS);
-        _banner?.remove();
-        _banner = null;
-
-        document.removeEventListener("keydown", _onKeydown);
-        document.removeEventListener("click", _onDocClick, true);
-    }
-
-    function _showBanner() {
-        _banner = document.createElement("div");
-        _banner.className = "vivaldi-swift-reposition-banner";
-        _banner.innerHTML = `
-            <span>Drag any Speed Dial to reposition it.</span>
-            <button type="button">Done</button>`;
-        _banner.querySelector("button").addEventListener("click", exit);
-        document.body.appendChild(_banner);
-    }
-
-    function _onKeydown(e) {
-        if (e.key === "Escape") exit();
-    }
-
-    function _onDocClick(e) {
-        if (!e.target.closest(SELECTORS.speedDial) && !e.target.closest(".vivaldi-swift-reposition-banner")) {
-            exit();
-        }
-    }
-
-    return { enter, exit };
 
 })();
 
